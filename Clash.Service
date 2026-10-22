@@ -1,0 +1,2584 @@
+#!/system/bin/sh
+# 猫猫 TProxy Plus v2 — Mihomo transparent proxy service for the ZTE F50 (Android, mksh + toybox).
+# LAN TCP/UDP arriving on br0 is diverted with TPROXY; DNS stays with the F50 / AdGuard Home.
+# Output lines starting with "@" are machine readable (key=value); errors start with "ERROR:".
+SERVICE_VERSION=2.0.0
+umask 077
+export PATH="/system/bin:/system/xbin:/vendor/bin:$PATH"
+BASE=/data/clash
+PROXY=$BASE/Proxy
+CORE=$PROXY/Clash.Core
+CONFIG=$PROXY/config.yaml
+SOURCE=$PROXY/source.yaml
+# The core's home (-d): it may write here (cache.db, providers/), so nothing else lives in it.
+# Geodata and the dashboard are immutable; config, source and the core binary stay outside.
+HOME_DIR=$BASE/home
+UI=$HOME_DIR/ui
+GEOIP=$HOME_DIR/geoip.metadb
+GEOSITE=$HOME_DIR/GeoSite.dat
+ASN=$HOME_DIR/ASN.mmdb
+SCRIPTS=$BASE/Scripts
+SELF=$SCRIPTS/Clash.Service
+NORMALIZER=$SCRIPTS/normalize.awk
+SETTINGS=$BASE/settings.env
+SUBS=$BASE/subs
+STATE=$BASE/state
+JOBS=$BASE/jobs
+BACKUPS=$BASE/backups
+LOG=$BASE/mihomo.log
+PIDFILE=$BASE/mihomo.pid
+IDENTITY=$BASE/mihomo.identity
+TOKENFILE=$BASE/mihomo.session
+WATCHPID=$BASE/mihomo-watch.pid
+WATCHIDENTITY=$BASE/mihomo-watch.identity
+OWNER=$BASE/tproxy.owner
+OWNER_TAG=ufi-f50-tproxy-v1
+LOCK=$BASE/service.lock
+JOBLOCK=$BASE/jobs.lock
+SECRET_FILE=$BASE/controller.secret
+UPLOADS=/data/data/com.minikano.f50_sms/files/uploads
+CURL=/data/data/com.minikano.f50_sms/files/curl
+JQ=/data/data/com.minikano.f50_sms/files/jq
+BOOT=/sdcard/ufi_tools_boot.sh
+BOOT_TAG='# KANO_MM_TPROXY'
+BOOT_LINE="/system/bin/sh $SELF boot >/dev/null 2>&1 </dev/null $BOOT_TAG"
+CHAIN4=UFI_MM_TPROXY4
+CHAIN6=UFI_MM_TPROXY6
+DIVERT4=UFI_MM_DIVERT4
+DIVERT6=UFI_MM_DIVERT6
+GUARD4=UFI_MM_GUARD4
+GUARD6=UFI_MM_GUARD6
+MARK=0x20000000/0x20000000
+TS_MARK=0x80000/0xff0000
+TABLE=20251
+PREF=1100
+ROUTE_PROTO=186
+LAN=br0
+MIXED_PORT=7890
+TPROXY_PORT=7893
+CTRL_PORT=7788
+PINNED_TAG=v1.19.32
+PINNED_CORE_URL=https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-android-arm64-v8-v1.19.32.gz
+PINNED_CORE_SHA=42b1f2be8702484d3ae6238daab392622f54bd0d264966700f1f28f52596e326
+PINNED_CORE_RAW_SHA=bb9afbd48717f92d59e07da35fb694b83d40d6edb63eb9033c2ee4174137d195
+PINNED_GEO_URL=https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/d7fba95fbfc9eb82ec33b1762b3d7e11833eacd9/geoip.metadb
+PINNED_GEO_SHA=d476395e4bd08275ca60af346d48fc40676e8aab382f04a07910215bb2fc2223
+PINNED_XD_TAG=v1.273.1
+PINNED_XD_URL=https://github.com/MetaCubeX/metacubexd/releases/download/v1.273.1/compressed-dist.tgz
+PINNED_XD_SHA=a178e00b67acabcda2dcef00afa90be6a7bb261e466a67dad58c8478d9553603
+MAX_SOURCE_BYTES=4194304
+MAX_CORE_BYTES=134217728
+
+# ---------------------------------------------------------------- helpers
+# mksh (Android /system/bin/sh) has no printf builtin: every printf forks toybox (~18 ms on the F50).
+# print is builtin, so hot paths use out/outn instead.
+if [ -n "${KSH_VERSION:-}" ]; then
+    out() { print -r -- "$*"; }
+    outn() { print -nr -- "$*"; }
+else
+    out() { printf '%s\n' "$*"; }
+    outn() { printf '%s' "$*"; }
+fi
+say() { out "$*"; }
+kv() { out "@$1=$2"; }
+log() { out "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$LOG" 2>/dev/null; }
+fail() { LAST_FAIL=$*; say "ERROR: $*"; log "ERROR: $*"; return 1; }
+numeric() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+# Decimal without leading zeros (mksh reads 010 as octal) and at most 9 digits (32-bit arithmetic).
+num_in() {  # num_in <value> <min> <max>
+    case "$1" in ''|*[!0-9]*|0?*) return 1 ;; esac
+    [ "${#1}" -le 9 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+# Epoch seconds are already ten digits; compare their suffix without overflowing mksh integers.
+epoch_ok() {
+    case "$1" in ''|*[!0-9]*|0?*) return 1 ;; esac
+    [ "${#1}" -le 9 ] && return 0
+    [ "${#1}" = 10 ] || return 1
+    case "$1" in
+        1?????????) return 0 ;;
+        2?????????) eo_tail=${1#2}; [ "$eo_tail" -le 147483647 ] ;;
+        *) return 1 ;;
+    esac
+}
+b64() { outn "$1" | base64 -w 0 2>/dev/null; }
+NL='
+'
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    now() { outn "${EPOCHREALTIME%.*}"; }
+    tick() { T_NOW=${EPOCHREALTIME%.*}; }
+else
+    now() { date +%s; }
+    tick() { T_NOW=$(date +%s); }
+fi
+mono() { IFS=' ' read -r T_MONO _ < /proc/uptime; T_MONO=${T_MONO%.*}; }  # deadlines ignore clock steps
+stamp() { date +%Y%m%d-%H%M%S; }
+sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+fsize() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+# Toybox timeout may report 0 although the child failed; read the child's own status.
+mm_timeout() {
+    mm_limit=$1
+    shift
+    mm_sequence=$(( ${mm_sequence:-0} + 1 ))
+    mm_result="$STATE/.timeout.$$.$mm_sequence.rc"
+    rm -f "$mm_result" || return 1
+    if timeout -k 5 "$mm_limit" /system/bin/sh -c '
+        result_file=$1
+        shift
+        "$@" &
+        child=$!
+        trap "kill -TERM \$child 2>/dev/null; sleep 1; kill -KILL \$child 2>/dev/null; exit 124" TERM
+        wait "$child"
+        child_status=$?
+        printf "%s\n" "$child_status" > "$result_file" || exit 125
+        exit "$child_status"
+    ' mm_timeout "$mm_result" "$@"; then :; else :; fi
+    if [ -s "$mm_result" ]; then
+        IFS= read -r mm_status < "$mm_result" || mm_status=125
+        rm -f "$mm_result"
+        case "$mm_status" in ''|*[!0-9]*) return 125 ;; esac
+        [ "$mm_status" -le 255 ] || return 125
+        return "$mm_status"
+    fi
+    rm -f "$mm_result"
+    return 124
+}
+
+# Builtin-only process identity: state and starttime (field 22) from /proc/<pid>/stat.
+proc_stat() {
+    ps_pid=$1
+    ps_state=
+    ps_start=
+    numeric "$ps_pid" || return 1
+    [ -r "/proc/$ps_pid/stat" ] || return 1
+    IFS= read -r ps_line 2>/dev/null < "/proc/$ps_pid/stat" || return 1
+    ps_rest=${ps_line##*) }
+    set -f
+    # shellcheck disable=SC2086
+    set -- $ps_rest
+    set +f
+    ps_state=$1
+    ps_start=${20}
+    [ -n "$ps_start" ]
+}
+
+pid_matches() {
+    numeric "$1" && numeric "$2" || return 1
+    [ "$1" -gt 1 ] || return 1
+    pm_want=$2
+    proc_stat "$1" || return 1
+    [ "$ps_start" = "$pm_want" ] && [ "$ps_state" != Z ] && [ "$ps_state" != X ]
+}
+
+core_matches() {
+    pid_matches "$1" "$2" || return 1
+    cm_exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    [ "$cm_exe" = "$CORE" ] || [ "$cm_exe" = "$CORE (deleted)" ]
+}
+
+core_alive() {
+    [ -r "$PIDFILE" ] && [ -r "$IDENTITY" ] || return 1
+    IFS= read -r core_pid < "$PIDFILE" || return 1
+    IFS=' ' read -r identity_pid core_start < "$IDENTITY" || return 1
+    [ "$core_pid" = "$identity_pid" ] && core_matches "$core_pid" "$core_start"
+}
+
+# A hot reload cannot change -d. A process from the legacy layout must restart once on migration.
+core_home_matches() {
+    core_alive || return 1
+    tr '\000' '\n' < "/proc/$core_pid/cmdline" | awk -v home="$HOME_DIR" '
+        previous == "-d" && $0 == home { found = 1 }
+        { previous = $0 }
+        END { exit !found }
+    '
+}
+
+watch_alive() {
+    [ -r "$WATCHPID" ] && [ -r "$WATCHIDENTITY" ] || return 1
+    IFS= read -r watch_pid < "$WATCHPID" || return 1
+    IFS=' ' read -r identity_watch_pid watch_start < "$WATCHIDENTITY" || return 1
+    [ "$watch_pid" = "$identity_watch_pid" ] && pid_matches "$watch_pid" "$watch_start"
+}
+
+ensure_dirs() {
+    mkdir -p "$BASE" "$PROXY" "$SCRIPTS" "$BACKUPS" "$STATE" "$JOBS" "$SUBS" "$HOME_DIR" "$UI" || return 1
+    chmod 700 "$BASE" "$PROXY" "$SCRIPTS" "$BACKUPS" "$STATE" "$JOBS" "$SUBS" "$HOME_DIR" "$UI" 2>/dev/null
+    return 0
+}
+
+# Files delivered through the app's upload dir are owned by the app uid; make them root-only.
+own() { chown 0:0 "$@" 2>/dev/null; chmod "${OWN_MODE:-600}" "$@" 2>/dev/null; return 0; }
+
+lock_service() {  # lock_service <max-seconds>
+    exec 9>"$LOCK"
+    mono
+    ls_end=$((T_MONO + ${1:-30}))
+    while ! flock -n -x 9 9>&9; do
+        mono
+        [ "$T_MONO" -lt "$ls_end" ] || { exec 9>&-; return 1; }
+        sleep 0.25
+    done
+}
+unlock_service() { flock -u 9 9>&9 2>/dev/null; exec 9>&-; }
+
+service_busy() {
+    exec 7>"$LOCK"
+    # Closing the only descriptor releases a lock we may have taken.
+    if flock -n -x 7 7>&7; then exec 7>&-; return 1; fi
+    exec 7>&-
+    return 0
+}
+
+# The dashboard directory is served by the core and must not be writable by it: a subscription
+# provider "path:" inside the core's home could otherwise plant HTML there. Immutable files cannot
+# be written, renamed or created even by root.
+protect_ui() { [ -d "$UI" ] && chattr -R +i "$UI" 2>/dev/null; return 0; }
+unprotect_ui() { protections_open=1; [ -d "$UI" ] && chattr -R -i "$UI" 2>/dev/null; return 0; }
+geo_lock() { for gl in "$GEOIP" "$GEOSITE" "$ASN"; do [ -f "$gl" ] && chattr +i "$gl" 2>/dev/null; done; return 0; }
+geo_unlock() { protections_open=1; for gl in "$GEOIP" "$GEOSITE" "$ASN"; do [ -f "$gl" ] && chattr -i "$gl" 2>/dev/null; done; return 0; }
+
+migrate_home() {  # Keep the legacy layout intact for rollback; geodata must use separate inodes.
+    [ -d "$HOME_DIR" ] || { mkdir -p "$HOME_DIR" && chmod 700 "$HOME_DIR"; } || return 1
+    for mh in geoip.metadb GeoSite.dat ASN.mmdb cache.db; do
+        if [ -f "$PROXY/$mh" ] && [ ! -e "$HOME_DIR/$mh" ]; then
+            if [ "$mh" = cache.db ]; then
+                ln "$PROXY/$mh" "$HOME_DIR/$mh" 2>/dev/null || cp -p "$PROXY/$mh" "$HOME_DIR/$mh" || return 1
+            else
+                cp -p "$PROXY/$mh" "$HOME_DIR/$mh" || return 1
+            fi
+        fi
+    done
+    if [ ! -s "$UI/index.html" ] && [ -s "$PROXY/ui/index.html" ]; then
+        mkdir -p "$UI" && cp -p "$PROXY/ui/index.html" "$UI/index.html" && own "$UI/index.html" || return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- settings
+setting_ok() {
+    so_v=$2
+    case "$1" in
+        MM_GUARD_TS|MM_IPV6|MM_UDP|MM_QUIC_BLOCK|MM_SNIFF|MM_AUTO_RESTART)
+            case "$so_v" in 0|1) return 0 ;; esac; return 1 ;;
+        MM_DEV_MODE) case "$so_v" in all|bypass|only) return 0 ;; esac; return 1 ;;
+        MM_DEV_LIST) dev_list_ok "$so_v"; return ;;
+        MM_BYPASS_PORTS) port_list_ok "$so_v"; return ;;
+        MM_MODE) case "$so_v" in rule|global|direct) return 0 ;; esac; return 1 ;;
+        MM_LOG_LEVEL) case "$so_v" in silent|error|warning|info|debug) return 0 ;; esac; return 1 ;;
+        MM_LOG_MAX_KB) num_in "$so_v" 128 16384; return ;;
+        MM_SUB_ACTIVE) [ -z "$so_v" ] || sub_id_ok "$so_v"; return ;;
+        MM_SUB_INTERVAL) case "$so_v" in 0|6|12|24|48|72) return 0 ;; esac; return 1 ;;
+        MM_SUB_UA)
+            [ -n "$so_v" ] && [ "${#so_v}" -le 64 ] || return 1
+            case "$so_v" in *[!A-Za-z0-9._/\(\)+\ -]*) return 1 ;; esac; return 0 ;;
+        MM_DL_VIA) case "$so_v" in auto|direct|proxy) return 0 ;; esac; return 1 ;;
+        MM_GH_MIRROR)
+            [ -z "$so_v" ] && return 0
+            [ "${#so_v}" -le 120 ] || return 1
+            case "$so_v" in https://?*/) ;; *) return 1 ;; esac
+            case "$so_v" in *[!A-Za-z0-9._~:/?#@%=+-]*) return 1 ;; esac; return 0 ;;
+        MM_DNS) dns_list_ok "$so_v"; return ;;
+        MM_MEMLIMIT) [ "$so_v" = 0 ] || num_in "$so_v" 64 512; return ;;
+    esac
+    return 1
+}
+
+SETTING_KEYS='MM_GUARD_TS MM_IPV6 MM_UDP MM_QUIC_BLOCK MM_SNIFF MM_AUTO_RESTART MM_DEV_MODE MM_DEV_LIST MM_BYPASS_PORTS MM_MODE MM_LOG_LEVEL MM_LOG_MAX_KB MM_SUB_ACTIVE MM_SUB_INTERVAL MM_SUB_UA MM_DL_VIA MM_GH_MIRROR MM_DNS MM_MEMLIMIT'
+
+settings_defaults() {
+    MM_GUARD_TS=1; MM_IPV6=1; MM_UDP=1; MM_QUIC_BLOCK=0; MM_SNIFF=1; MM_AUTO_RESTART=1
+    MM_DEV_MODE=all; MM_DEV_LIST=; MM_BYPASS_PORTS=123,853; MM_MODE=rule; MM_LOG_LEVEL=warning
+    MM_LOG_MAX_KB=1024; MM_SUB_ACTIVE=; MM_SUB_INTERVAL=0; MM_SUB_UA=clash.meta; MM_DL_VIA=auto
+    MM_GH_MIRROR=; MM_DNS=223.5.5.5,119.29.29.29; MM_MEMLIMIT=128
+}
+
+# Never sourced: every key is matched against the fixed list and every value validated.
+load_settings() {
+    settings_defaults
+    [ -r "$SETTINGS" ] || return 0
+    while IFS= read -r ls_kv || [ -n "$ls_kv" ]; do
+        ls_k=${ls_kv%%=*}
+        ls_v=${ls_kv#*=}
+        [ "$ls_k" = "$ls_kv" ] && continue
+        case " $SETTING_KEYS " in *" $ls_k "*) ;; *) continue ;; esac
+        setting_ok "$ls_k" "$ls_v" && eval "$ls_k=\$ls_v"
+    done < "$SETTINGS"
+    return 0
+}
+
+write_settings() {
+    ws_tmp=$SETTINGS.tmp.$$
+    : > "$ws_tmp" || return 1
+    for ws_k in $SETTING_KEYS; do
+        eval "ws_v=\$$ws_k"
+        printf '%s=%s\n' "$ws_k" "$ws_v" >> "$ws_tmp" || { rm -f "$ws_tmp"; return 1; }
+    done
+    own "$ws_tmp"
+    mv -f "$ws_tmp" "$SETTINGS"
+}
+
+set_setting() { setting_ok "$1" "$2" || return 1; eval "$1=\$2"; }
+
+sub_id_ok() { case "$1" in ''|*[!a-z0-9]*) return 1 ;; esac; [ "${#1}" -le 16 ]; }
+
+ipv4_ok() {
+    i4=$1
+    case "$i4" in ''|*[!0-9.]*) return 1 ;; esac
+    IFS=.
+    set -f
+    # shellcheck disable=SC2086
+    set -- $i4
+    set +f
+    unset IFS
+    [ "$#" = 4 ] || return 1
+    for i4o in "$@"; do
+        [ "$i4o" = 0 ] || num_in "$i4o" 1 255 || return 1
+    done
+}
+
+dev_item_ok() {
+    case "$1" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) return 0 ;;
+        */*) ipv4_ok "${1%/*}" && num_in "${1#*/}" 8 32; return ;;
+        *) ipv4_ok "$1"; return ;;
+    esac
+}
+
+dev_list_ok() {
+    [ -z "$1" ] && return 0
+    [ "${#1}" -le 1400 ] || return 1
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    unset IFS
+    [ "$#" -le 64 ] || return 1
+    for dl_item in "$@"; do dev_item_ok "$dl_item" || return 1; done
+}
+
+port_list_ok() {
+    [ -z "$1" ] && return 0
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    unset IFS
+    [ "$#" -le 16 ] || return 1
+    for pl_port in "$@"; do
+        num_in "$pl_port" 1 65535 || return 1
+        case "$pl_port" in 53|"$MIXED_PORT"|"$TPROXY_PORT"|"$CTRL_PORT") return 1 ;; esac
+    done
+}
+
+ipv6_ok() {
+    case "$1" in ''|*[!0-9A-Fa-f:]*|*:::*) return 1 ;; esac
+    i6_after=${1#*::}
+    if [ "$i6_after" != "$1" ]; then case "$i6_after" in *::*) return 1 ;; esac; fi
+    IFS=:
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    unset IFS
+    [ "$#" -le 8 ] || return 1
+    for i6_g in "$@"; do [ "${#i6_g}" -le 4 ] || return 1; done
+}
+
+dns_host_ok() {  # host, host:port, [v6] or [v6]:port
+    dh=$1
+    case "$dh" in
+        \[*)
+            dh_v6=${dh#\[}
+            dh_rest=${dh_v6#*\]}
+            [ "$dh_rest" != "$dh_v6" ] || return 1
+            dh_v6=${dh_v6%%\]*}
+            ipv6_ok "$dh_v6" || return 1
+            case "$dh_rest" in '') return 0 ;; :*) num_in "${dh_rest#:}" 1 65535; return ;; *) return 1 ;; esac ;;
+        *:*:*) return 1 ;;
+        *:*) num_in "${dh##*:}" 1 65535 || return 1; dh=${dh%:*} ;;
+    esac
+    case "$dh" in ''|*[!A-Za-z0-9.-]*|.*|-*) return 1 ;; esac
+    return 0
+}
+
+dns_list_ok() {
+    [ -n "$1" ] && [ "${#1}" -le 400 ] || return 1
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    unset IFS
+    [ "$#" -ge 1 ] && [ "$#" -le 4 ] || return 1
+    for dn_item in "$@"; do
+        case "$dn_item" in
+            https://*)
+                dn_rest=${dn_item#https://}
+                dn_host=${dn_rest%%/*}
+                dn_path=${dn_rest#"$dn_host"}
+                dns_host_ok "$dn_host" || return 1
+                case "$dn_path" in *[!A-Za-z0-9._~/?=\&%+-]*) return 1 ;; esac ;;
+            tls://*|quic://*) dns_host_ok "${dn_item#*://}" || return 1 ;;
+            *:*) ipv6_ok "$dn_item" || return 1 ;;
+            *) ipv4_ok "$dn_item" || return 1 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- secret / config generation
+ensure_secret() {
+    if [ -r "$SECRET_FILE" ]; then
+        IFS= read -r es_v < "$SECRET_FILE"
+        case "$es_v" in *[!a-f0-9]*|'') ;; *) [ "${#es_v}" = 48 ] && { SECRET=$es_v; return 0; } ;; esac
+    fi
+    es_v=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+    case "$es_v" in *[!a-f0-9]*|'') return 1 ;; esac
+    [ "${#es_v}" = 48 ] || return 1
+    printf '%s\n' "$es_v" > "$SECRET_FILE.tmp.$$" && own "$SECRET_FILE.tmp.$$" && mv -f "$SECRET_FILE.tmp.$$" "$SECRET_FILE" || return 1
+    SECRET=$es_v
+}
+
+yaml_flow_list() {  # comma separated, already validated -> ["a", "b"]
+    yf_out=
+    IFS=,
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    unset IFS
+    for yf_item in "$@"; do yf_out="$yf_out${yf_out:+, }\"$yf_item\""; done
+    outn "[$yf_out]"
+}
+
+bool() { if [ "$1" = 1 ]; then outn true; else outn false; fi; }
+
+lan_allowed() {  # sources allowed on the mixed (HTTP/SOCKS) port: loopback, LAN, Tailscale
+    la_list='"127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48", "fe80::/10", "fc00::/7"'
+    la_v4=$(ip -4 -o addr show dev "$LAN" 2>/dev/null | awk '{print $4}')
+    la_v6=$(ip -6 -o addr show dev "$LAN" scope global 2>/dev/null | awk '{print $4}')
+    [ -n "$la_v4" ] || la_v4=192.168.0.0/16
+    for la in $la_v4 $la_v6; do
+        case "$la" in ''|*[!0-9A-Fa-f:./]*) continue ;; esac
+        la_list="$la_list, \"$la\""
+    done
+    outn "[$la_list]"
+}
+
+emit_header() {
+    cat <<EOF
+# 由猫猫 TProxy Plus $SERVICE_VERSION 生成，请勿直接编辑；请在插件中编辑源配置或修改设置。
+mixed-port: $MIXED_PORT
+port: 0
+socks-port: 0
+redir-port: 0
+tproxy-port: $TPROXY_PORT
+allow-lan: true
+bind-address: "*"
+lan-allowed-ips: $(lan_allowed)
+lan-disallowed-ips: []
+authentication: []
+skip-auth-prefixes: []
+mode: $MM_MODE
+ipv6: $(bool "$MM_IPV6")
+log-level: $MM_LOG_LEVEL
+find-process-mode: "off"
+external-controller: "0.0.0.0:$CTRL_PORT"
+external-controller-cors:
+  allow-origins: ["http://127.0.0.1:$CTRL_PORT"]
+  allow-private-network: false
+secret: "$SECRET"
+external-ui: "$UI"
+profile:
+  store-selected: true
+  store-fake-ip: false
+geodata-mode: false
+geodata-loader: memconservative
+geo-auto-update: false
+geox-url:
+  geoip: "http://127.0.0.1:9/disabled/geoip.dat"
+  geosite: "http://127.0.0.1:9/disabled/geosite.dat"
+  mmdb: "http://127.0.0.1:9/disabled/geoip.metadb"
+  asn: "http://127.0.0.1:9/disabled/asn.mmdb"
+tun:
+  enable: false
+sniffer:
+  enable: $(bool "$MM_SNIFF")
+  override-destination: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
+dns:
+  enable: true
+  ipv6: $(bool "$MM_IPV6")
+  enhanced-mode: redir-host
+  default-nameserver: ["223.5.5.5", "119.29.29.29"]
+  nameserver: $(yaml_flow_list "$MM_DNS")
+  proxy-server-nameserver: $(yaml_flow_list "$MM_DNS")
+listeners: []
+tunnels: []
+iptables:
+  enable: false
+ntp:
+  enable: false
+tuic-server:
+  enable: false
+experimental: {}
+tls: {}
+external-controller-unix: ""
+external-controller-pipe: ""
+external-controller-tls: ""
+external-controller-routing-mark: 0
+external-ui-url: ""
+external-ui-name: ""
+external-doh-server: ""
+interface-name: ""
+routing-mark: 0
+ss-config: ""
+vmess-config: ""
+inbound-tfo: false
+inbound-mptcp: false
+geo-update-interval: 24
+EOF
+}
+
+# normalize <raw> <body-out> <summary-out>; sets sum_* variables
+normalize() {
+    nz_norm=${NORMALIZER_OVERRIDE:-$NORMALIZER}
+    [ -r "$nz_norm" ] || { fail "缺少配置过滤器 $nz_norm，请重新安装/升级组件"; return 1; }
+    rm -f "$3"
+    if LC_ALL=C awk -v sumfile="$3" -f "$nz_norm" "$1" > "$2"; then :; else
+        nz_err=$(sed -n 's/^@error=//p' "$3" 2>/dev/null)
+        fail "${nz_err:-配置解析失败}"
+        return 1
+    fi
+    sum_proxies='?'; sum_groups='?'; sum_rules='?'; sum_providers=0; sum_rule_providers=0
+    sum_geosite=0; sum_geoip=0; sum_asn=0; sum_dropped=
+    while IFS= read -r nz_line; do
+        case "$nz_line" in
+            @proxies=*) sum_proxies=${nz_line#*=} ;;
+            @groups=*) sum_groups=${nz_line#*=} ;;
+            @rules=*) sum_rules=${nz_line#*=} ;;
+            @providers=*) sum_providers=${nz_line#*=} ;;
+            @rule_providers=*) sum_rule_providers=${nz_line#*=} ;;
+            @geosite=*) sum_geosite=${nz_line#*=} ;;
+            @geoip=*) sum_geoip=${nz_line#*=} ;;
+            @asn=*) sum_asn=${nz_line#*=} ;;
+            @dropped=*) sum_dropped=${nz_line#*=} ;;
+        esac
+    done < "$3"
+}
+
+# generate_config <source> <out> <workdir>
+generate_config() {
+    gc_size=$(fsize "$1")
+    numeric "$gc_size" && [ "$gc_size" -gt 0 ] || { fail '源配置为空'; return 1; }
+    [ "$gc_size" -le "$MAX_SOURCE_BYTES" ] || { fail '源配置超过 4 MB'; return 1; }
+    normalize "$1" "$3/body.yaml" "$3/summary" || return 1
+    ensure_secret || { fail '控制器密钥生成失败'; return 1; }
+    { emit_header; printf '\n'; cat "$3/body.yaml"; } > "$2" || { fail '写入配置失败'; return 1; }
+    own "$2"
+}
+
+test_config() {  # test_config <config> [core] [home]
+    tc_core=${2:-$CORE}
+    tc_home=${3:-$HOME_DIR}
+    tc_bin=$STATE/.core.test.$$
+    ln -f "$tc_core" "$tc_bin" 2>/dev/null || tc_bin=$tc_core
+    tc_out=$(SAFE_PATHS=$UI mm_timeout 60 "$tc_bin" -t -d "$tc_home" -f "$1" 2>&1)
+    tc_rc=$?
+    [ "$tc_bin" = "$tc_core" ] || rm -f "$tc_bin"
+    if [ "$tc_rc" != 0 ]; then
+        printf '%s\n' "$tc_out" | grep -v -E '^time=.*level=(info|debug)' | tail -n 12
+        [ "$tc_rc" = 124 ] && fail '配置校验超时（60 秒）' && return 1
+        fail '配置校验失败（Mihomo -t）'
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------- downloads
+dl_order() {
+    case "$MM_DL_VIA" in
+        direct) outn direct ;;
+        proxy) outn 'proxy direct' ;;
+        *) outn 'direct proxy' ;;
+    esac
+    [ -n "$MM_GH_MIRROR" ] && outn ' mirror'
+    out
+}
+
+proxy_usable() { core_alive && bound_port 1ED2 tcp; }
+
+# download <url> <dest> <max-seconds> <max-bytes> [extra curl args...]
+download() {
+    dl_url=$1
+    dl_dest=$2
+    dl_time=$3
+    dl_max=$4
+    shift 4
+    case "$dl_url" in https://*) dl_redir='=https' ;; *) dl_redir='=https,http' ;; esac
+    rm -f "$dl_dest.part"
+    for dl_via in $(dl_order); do
+        dl_eff=$dl_url
+        case "$dl_via" in
+            proxy) proxy_usable || continue ;;
+            mirror) case "$dl_url" in https://github.com/*/releases/download/*|https://raw.githubusercontent.com/*) dl_eff=$MM_GH_MIRROR$dl_url ;; *) continue ;; esac ;;
+        esac
+        say "下载（$dl_via）：${DL_LABEL:-${dl_url%%\?*}}"
+        dl_px=
+        [ "$dl_via" = proxy ] && dl_px="-x http://127.0.0.1:$MIXED_PORT"
+        # --max-filesize only sees Content-Length; head enforces the cap for chunked/compressed bodies.
+        # shellcheck disable=SC2086
+        mm_timeout "$((dl_time + 20))" /system/bin/sh -c 'set -o pipefail; dl_max=$1; dl_out=$2; shift 2; "$@" | head -c "$dl_max" > "$dl_out"' \
+            download "$((dl_max + 1))" "$dl_dest.part" "$CURL" $dl_px --proto '=https,http' --proto-redir "$dl_redir" \
+            --max-redirs 5 -fL --connect-timeout 15 --max-time "$dl_time" -sS "$@" "$dl_eff"
+        dl_rc=$?
+        dl_size=$(fsize "$dl_dest.part")
+        numeric "$dl_size" || dl_size=0
+        if [ "${#dl_size}" -gt 9 ] || [ "$dl_size" -gt "$dl_max" ]; then
+            say "  内容超过大小上限（$((dl_max / 1048576)) MB），已放弃"
+            rm -f "$dl_dest.part"
+            continue
+        fi
+        if [ "$dl_rc" = 0 ] && [ "$dl_size" -gt 0 ]; then
+            mv -f "$dl_dest.part" "$dl_dest"
+            DL_VIA_USED=$dl_via
+            return 0
+        fi
+        say "  失败（退出码 $dl_rc）"
+        rm -f "$dl_dest.part"
+    done
+    return 1
+}
+
+# gh_release <owner/repo> <tag|latest> <json-out>
+gh_release() {
+    case "$2" in latest) gr_path=latest ;; v[0-9]*) gr_path=tags/$2 ;; *) return 1 ;; esac
+    download "https://api.github.com/repos/$1/releases/$gr_path" "$3" 60 4194304 -H 'Accept: application/vnd.github+json'
+}
+
+# gh_asset <json> <asset-name> -> "url sha256" ; verified format
+gh_asset() {
+    ga=$("$JQ" -r --arg n "$2" '.assets[] | select(.name == $n) | "\(.browser_download_url) \(.digest // "")"' "$1" 2>/dev/null | head -n 1)
+    ga_url=${ga%% *}
+    ga_sha=${ga#* }
+    ga_sha=${ga_sha#sha256:}
+    case "$ga_url" in https://github.com/*) ;; *) return 1 ;; esac
+    case "$ga_sha" in *[!0-9a-f]*|'') return 1 ;; esac
+    [ "${#ga_sha}" = 64 ] || return 1
+    out "$ga_url $ga_sha"
+}
+
+verify_sha() {  # file expected
+    vs_actual=$(sha_of "$1")
+    [ -n "$vs_actual" ] && [ "$vs_actual" = "$2" ] && return 0
+    say "SHA-256 不匹配：期望 $2，实际 ${vs_actual:-无法计算}"
+    return 1
+}
+
+# ---------------------------------------------------------------- network helpers
+ipt() { iptables -w 5 "$@"; }
+ip6t() { ip6tables -w 5 "$@"; }
+xt() { if [ "$1" = 4 ]; then shift; iptables -w 5 "$@"; else shift; ip6tables -w 5 "$@"; fi; }
+xt_restore() { if [ "$1" = 4 ]; then iptables-restore -w 5 --noflush; else ip6tables-restore -w 5 --noflush; fi; }
+
+owned() { [ -r "$OWNER" ] && IFS= read -r ow_tag < "$OWNER" && [ "$ow_tag" = "$OWNER_TAG" ]; }
+
+bound_port() {
+    bp_state=0A
+    [ "$2" = udp ] && bp_state=07
+    awk -v port="$1" -v state="$bp_state" 'FNR > 1 && substr($2, length($2)-3) == port && $4 == state {found=1} END {exit !found}' \
+        "/proc/net/$2" "/proc/net/${2}6" 2>/dev/null
+}
+listeners_ready() { bound_port 1ED5 tcp && bound_port 1ED5 udp && bound_port 1ED2 tcp && bound_port 1E6C tcp; }
+
+# Mihomo opens its listeners before loading proxy/rule providers and drops every proxied
+# connection until loading is done. A CONNECT probe through the mixed port is closed at once while
+# loading; once running, the core actually dials the (closed) target and the probe waits.
+tunnel_ready() {
+    tr_t=$("$CURL" -s -o /dev/null -w '%{time_total}' --max-time 2 -x "http://127.0.0.1:$MIXED_PORT" https://127.0.0.1:9/ 2>/dev/null)
+    case "$?" in 35|52|56) ;; *) return 0 ;; esac
+    case "$tr_t" in 0.0[0-9]*) return 1 ;; esac
+    return 0
+}
+
+wait_providers() {  # only configs with providers have a loading phase worth waiting for
+    [ "${sum_providers:-0}" = 1 ] || [ "${sum_rule_providers:-0}" = 1 ] || return 0
+    tunnel_ready && return 0
+    say '等待配置中的节点集/规则集加载完成…'
+    mono
+    wp_end=$((T_MONO + 90))
+    while ! tunnel_ready; do
+        mono
+        if [ "$T_MONO" -ge "$wp_end" ]; then log 'Providers still loading after 90 s; enabling interception anyway.'; return 0; fi
+        sleep 1
+    done
+    return 0
+}
+
+# Addresses inside these ranges never need their own RETURN rule.
+V4_BYPASS='0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4'
+V6_BYPASS='::/128 ::1/128 ::ffff:0:0/96 100::/64 2001:db8::/32 fc00::/7 fe80::/10 ff00::/8'
+
+v4_covered() {  # address inside the static bypass list?
+    case "$1" in
+        0.*|10.*|127.*|169.254.*|192.168.*|192.0.0.*|192.0.2.*|198.51.100.*|203.0.113.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*|198.1[89].*) return 0 ;;
+        22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 0 ;;
+        100.*) cv_o2=${1#100.}; cv_o2=${cv_o2%%.*}; numeric "$cv_o2" && [ "$cv_o2" -ge 64 ] && [ "$cv_o2" -le 127 ]; return ;;
+    esac
+    return 1
+}
+v6_covered() {
+    case "$1" in
+        ::|::1|::ffff:*|[fF][cCdD]*|[fF][eE][89aAbB]*|[fF][fF]*|2001:db8:*|2001:0db8:*|100::*) return 0 ;;
+    esac
+    return 1
+}
+
+local_addrs() {  # family -> one address per line (excluding covered ones; br0 first)
+    ip "-$1" -o addr show 2>/dev/null | awk -v lan="$LAN" '{split($4,a,"/"); if ($2 == lan) print "0 " a[1]; else print "1 " a[1]}' | sort -u | cut -d' ' -f2
+}
+ts_routes() { ip "-$1" route show table 52 2>/dev/null | awk '/dev tailscale0/ && $1 != "default" {print $1}'; }
+
+net_fingerprint() {
+    { ip -4 -o addr show; ip -6 -o addr show; ip -4 route show table 52; ip -6 route show table 52; } 2>/dev/null |
+        awk '{for (i = 1; i <= NF; i++) if ($i == "inet" || $i == "inet6") print $(i+1); if ($0 ~ /tailscale0/ && $1 != "default") print $1}' | sort | md5sum | cut -d' ' -f1
+}
+
+# Mangle chains: CHAIN (classification) -> DIVERT (TPROXY). Printed as iptables-restore input.
+mangle_rules() {
+    mr_f=$1
+    if [ "$mr_f" = 4 ]; then mr_c=$CHAIN4; mr_d=$DIVERT4; mr_bypass=$V4_BYPASS; else mr_c=$CHAIN6; mr_d=$DIVERT6; mr_bypass=$V6_BYPASS; fi
+    out '*mangle'
+    out ":$mr_c - [0:0]"
+    out ":$mr_d - [0:0]"
+    if [ "$MM_QUIC_BLOCK" = 1 ] && [ "$MM_UDP" = 1 ]; then
+        out "-A ${mr_d} -p udp -m udp --dport 443 -j DROP"
+    fi
+    out "-A ${mr_d} -p tcp -j TPROXY --on-port ${TPROXY_PORT} --tproxy-mark ${MARK}"
+    [ "$MM_UDP" = 1 ] && out "-A ${mr_d} -p udp -j TPROXY --on-port ${TPROXY_PORT} --tproxy-mark ${MARK}"
+    # Router itself first (most LAN traffic to the device), then established transparent flows.
+    for mr_a in $(local_addrs "$mr_f"); do
+        if [ "$mr_f" = 4 ]; then v4_covered "$mr_a" && [ "$mr_a" != "$LAN_ADDR4" ] && continue; else v6_covered "$mr_a" && continue; fi
+        out "-A ${mr_c} -d ${mr_a} -j RETURN"
+    done
+    out "-A ${mr_c} -p tcp -m socket --transparent -j MARK --set-xmark ${MARK}"
+    out "-A ${mr_c} -m mark --mark ${MARK} -j RETURN"
+    out "-A ${mr_c} -m mark --mark ${TS_MARK} -j RETURN"
+    for mr_cidr in $mr_bypass; do out "-A ${mr_c} -d ${mr_cidr} -j RETURN"; done
+    for mr_cidr in $(ts_routes "$mr_f"); do
+        case "$mr_cidr" in *[!0-9a-fA-F:./]*) continue ;; esac
+        if [ "$mr_f" = 4 ]; then v4_covered "${mr_cidr%/*}" && continue; else v6_covered "${mr_cidr%/*}" && continue; fi
+        out "-A ${mr_c} -d ${mr_cidr} -j RETURN"
+    done
+    out "-A ${mr_c} -p tcp -m tcp --dport 53 -j RETURN"; out "-A ${mr_c} -p udp -m udp --dport 53 -j RETURN"
+    if [ -n "$MM_BYPASS_PORTS" ]; then
+        IFS=,
+        set -f
+        # shellcheck disable=SC2086
+        set -- $MM_BYPASS_PORTS
+        set +f
+        unset IFS
+        for mr_p in "$@"; do
+            out "-A ${mr_c} -p tcp -m tcp --dport ${mr_p} -j RETURN"
+            [ "$MM_UDP" = 1 ] && out "-A ${mr_c} -p udp -m udp --dport ${mr_p} -j RETURN"
+        done
+    fi
+    mr_final=$mr_d
+    if [ "$MM_DEV_MODE" != all ] && [ -n "$MM_DEV_LIST" ]; then
+        if [ "$MM_DEV_MODE" = bypass ]; then mr_target=RETURN; else mr_target=$mr_d; mr_final=RETURN; fi
+        IFS=,
+        set -f
+        # shellcheck disable=SC2086
+        set -- $MM_DEV_LIST
+        set +f
+        unset IFS
+        for mr_dev in "$@"; do
+            case "$mr_dev" in
+                *:*) out "-A ${mr_c} -m mac --mac-source ${mr_dev} -j ${mr_target}";;
+                *) [ "$mr_f" = 4 ] && out "-A ${mr_c} -s ${mr_dev} -j ${mr_target}";;
+            esac
+        done
+    elif [ "$MM_DEV_MODE" = only ]; then
+        mr_final=RETURN
+    fi
+    out "-A ${mr_c} -j ${mr_final}"
+}
+
+guard_rules() {
+    if [ "$1" = 4 ]; then gr_c=$GUARD4; else gr_c=$GUARD6; fi
+    out '*filter'
+    out ":$gr_c - [0:0]"
+    out "-A ${gr_c} -i lo -j RETURN"; out "-A ${gr_c} -i ${LAN} -j RETURN"
+    [ "$MM_GUARD_TS" = 1 ] && out "-A ${gr_c} -i tailscale0 -j RETURN"
+    for gr_p in "$MIXED_PORT" "$TPROXY_PORT"; do
+        out "-A ${gr_c} -p tcp -m tcp --dport ${gr_p} -j DROP"; out "-A ${gr_c} -p udp -m udp --dport ${gr_p} -j DROP"
+    done
+    out "-A ${gr_c} -p tcp -m tcp --dport ${CTRL_PORT} -j DROP"
+}
+
+hooks_wanted() {  # family -> desired PREROUTING hook lines (as printed by -S)
+    if [ "$1" = 4 ]; then hw_c=$CHAIN4; else hw_c=$CHAIN6; fi
+    [ "$1" = 6 ] && [ "$MM_IPV6" != 1 ] && return 0
+    out "-A PREROUTING -i ${LAN} -p tcp -j ${hw_c}"
+    [ "$MM_UDP" = 1 ] && out "-A PREROUTING -i ${LAN} -p udp -j ${hw_c}"
+    return 0
+}
+
+lan_addr4() { LAN_ADDR4=$(ip -4 -o addr show dev "$LAN" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'); }
+
+# apply_family <4|6> : (re)build chains and hooks atomically; guard separately.
+apply_family() {
+    af_f=$1
+    if [ "$af_f" = 4 ]; then af_c=$CHAIN4; else af_c=$CHAIN6; fi
+    af_snap=$(xt "$af_f" -t mangle -S PREROUTING 2>/dev/null) || return 1
+    {
+        mangle_rules "$af_f"
+        af_want=$(hooks_wanted "$af_f")
+        # Remove unwanted/duplicate hooks, then add missing ones at the top.
+        printf '%s\n' "$af_snap" | awk -v c="$af_c" '$1 == "-A" && $2 == "PREROUTING" && $NF == c' | while IFS= read -r af_line; do
+            printf '%s\n' "${af_line#-A }" | sed 's/^/-D /'
+        done
+        printf '%s\n' "$af_want" | while IFS= read -r af_line; do
+            [ -n "$af_line" ] && printf '%s\n' "$af_line" | sed 's/^-A PREROUTING /-I PREROUTING 1 /'
+        done
+        printf 'COMMIT\n'
+    } > "$STATE/.rules.$af_f.$$"
+    xt_restore "$af_f" < "$STATE/.rules.$af_f.$$"
+    af_rc=$?
+    [ "$af_rc" = 0 ] || cp -f "$STATE/.rules.$af_f.$$" "$STATE/last-failed-rules.$af_f" 2>/dev/null
+    rm -f "$STATE/.rules.$af_f.$$"
+    return "$af_rc"
+}
+
+apply_guard() {
+    ag_f=$1
+    if [ "$ag_f" = 4 ]; then ag_c=$GUARD4; else ag_c=$GUARD6; fi
+    {
+        guard_rules "$ag_f"
+        xt "$ag_f" -C INPUT -j "$ag_c" >/dev/null 2>&1 || out "-I INPUT 1 -j $ag_c"
+        out COMMIT
+    } > "$STATE/.guard.$ag_f.$$"
+    xt_restore "$ag_f" < "$STATE/.guard.$ag_f.$$"
+    ag_rc=$?
+    rm -f "$STATE/.guard.$ag_f.$$"
+    return "$ag_rc"
+}
+
+remove_guard() {
+    rg_f=$1
+    if [ "$rg_f" = 4 ]; then rg_c=$GUARD4; else rg_c=$GUARD6; fi
+    rg_snap=$(xt "$rg_f" -S 2>/dev/null) || return 1
+    printf '%s\n' "$rg_snap" | awk -v c="$rg_c" '$1 == "-N" && $2 == c {found=1} END {exit !found}' || return 0
+    {
+        printf '*filter\n'
+        printf '%s\n' "$rg_snap" | awk -v c="$rg_c" '$1 == "-A" && $2 == "INPUT" && $NF == c {sub(/^-A /, "-D "); print}'
+        printf '%s\n' "-F $rg_c" "-X $rg_c" COMMIT
+    } | xt_restore "$rg_f"
+}
+
+routes_up() {
+    for ru_f in 4 6; do
+        [ "$ru_f" = 6 ] && [ "$MM_IPV6" != 1 ] && continue
+        ip "-$ru_f" rule show 2>/dev/null | awk -v p="$PREF:" -v t="$TABLE" '$1 == p && $NF == t {found=1} END {exit !found}' ||
+            ip "-$ru_f" rule add priority "$PREF" fwmark "$MARK" lookup "$TABLE" || return 1
+        ip "-$ru_f" route show table "$TABLE" 2>/dev/null | grep -q '^local default' ||
+            ip "-$ru_f" route add local default dev lo table "$TABLE" proto "$ROUTE_PROTO" || return 1
+    done
+}
+
+# remove_family <4|6>: owned hooks, chains (TPROXY + DIVERT), policy rule and route. Atomic per table.
+remove_family() {
+    rf_f=$1
+    if [ "$rf_f" = 4 ]; then rf_c=$CHAIN4; rf_d=$DIVERT4; else rf_c=$CHAIN6; rf_d=$DIVERT6; fi
+    rf_snap=$(xt "$rf_f" -t mangle -S 2>/dev/null) || return 1
+    rf_cmds=$(printf '%s\n' "$rf_snap" | awk -v c="$rf_c" -v d="$rf_d" '
+        $1 == "-A" && $2 == "PREROUTING" && ($NF == c || $NF == d) {sub(/^-A /, "-D "); print; next}
+        $1 == "-N" && ($2 == c || $2 == d) {chains[$2] = 1}
+        END {for (x in chains) print "-F " x; for (x in chains) print "-X " x}')
+    if [ -n "$rf_cmds" ]; then
+        printf '*mangle\n%s\nCOMMIT\n' "$rf_cmds" | xt_restore "$rf_f" || return 1
+    fi
+    rf_snap=$(xt "$rf_f" -t mangle -S 2>/dev/null) || return 1
+    printf '%s\n' "$rf_snap" | awk -v c="$rf_c" -v d="$rf_d" '$2 == c || $2 == d {f=1} {for (i = 1; i < NF; i++) if (($i == "-j" || $i == "-g") && ($(i+1) == c || $(i+1) == d)) f=1} END {exit !f}' && return 1
+    while :; do
+        rf_rules=$(ip "-$rf_f" rule show 2>/dev/null) || return 1
+        printf '%s\n' "$rf_rules" | awk -v p="$PREF:" -v t="$TABLE" '$1 == p && /fwmark 0x20000000\/0x20000000/ && $NF == t {found=1} END {exit !found}' || break
+        ip "-$rf_f" rule del priority "$PREF" fwmark "$MARK" lookup "$TABLE" >/dev/null 2>&1 || return 1
+    done
+    rf_routes=$(ip "-$rf_f" route show table all 2>/dev/null) || return 1
+    if printf '%s\n' "$rf_routes" | awk -v t="$TABLE" -v proto="$ROUTE_PROTO" '$1 == "local" && $2 == "default" && /dev lo/ {tf=0; pf=0; for (i = 1; i < NF; i++) {if ($i == "table" && $(i+1) == t) tf=1; if ($i == "proto" && $(i+1) == proto) pf=1} if (tf && pf) found=1} END {exit !found}'; then
+        ip "-$rf_f" route del local default dev lo table "$TABLE" proto "$ROUTE_PROTO" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+cleanup_network() {
+    if ! owned; then
+        if [ -e "$OWNER" ]; then log 'Unexpected firewall ownership marker; refusing cleanup.'; return 1; fi
+        remove_guard 4; remove_guard 6
+        return 0
+    fi
+    cn_ok=1
+    remove_family 4 || cn_ok=0
+    remove_family 6 || cn_ok=0
+    if [ "$cn_ok" = 1 ]; then
+        rm -f "$OWNER"
+        remove_guard 4 || log 'IPv4 guard removal failed.'
+        remove_guard 6 || log 'IPv6 guard removal failed.'
+        return 0
+    fi
+    log 'Firewall cleanup incomplete; ownership marker retained for retry.'
+    return 1
+}
+
+network_ready() {
+    owned || return 1
+    nr_s4=$(ipt -t mangle -S PREROUTING 2>/dev/null) || return 1
+    case "$NL$nr_s4$NL" in *"$NL-A PREROUTING -i $LAN -p tcp -j $CHAIN4$NL"*) ;; *) return 1 ;; esac
+    if [ "$MM_IPV6" = 1 ]; then
+        nr_s6=$(ip6t -t mangle -S PREROUTING 2>/dev/null) || return 1
+        case "$NL$nr_s6$NL" in *"$NL-A PREROUTING -i $LAN -p tcp -j $CHAIN6$NL"*) ;; *) return 1 ;; esac
+    fi
+    return 0
+}
+
+routes_ready() {  # policy rule and local route that deliver marked packets to the TPROXY socket
+    for rr_f in 4 6; do
+        [ "$rr_f" = 6 ] && [ "$MM_IPV6" != 1 ] && continue
+        ip "-$rr_f" rule show 2>/dev/null | awk -v p="$PREF:" -v t="$TABLE" '$1 == p && $NF == t {found=1} END {exit !found}' || return 1
+        rr_route=$(ip "-$rr_f" route show table "$TABLE" 2>/dev/null) || return 1
+        case "$rr_route" in "local default"*|*"${NL}local default"*) ;; *) return 1 ;; esac
+    done
+}
+
+net_up() {  # build guard + chains + routes; requires the core to be listening
+    lan_addr4
+    apply_family 4 || { fail 'IPv4 TPROXY 规则安装失败'; return 1; }
+    if [ "$MM_IPV6" = 1 ]; then
+        apply_family 6 || { fail 'IPv6 TPROXY 规则安装失败'; return 1; }
+    else
+        remove_family 6 || :
+    fi
+    routes_up || { fail '策略路由安装失败'; return 1; }
+    if [ "$MM_IPV6" != 1 ]; then
+        ip -6 rule del priority "$PREF" fwmark "$MARK" lookup "$TABLE" >/dev/null 2>&1
+        ip -6 route del local default dev lo table "$TABLE" proto "$ROUTE_PROTO" >/dev/null 2>&1
+    fi
+    net_fingerprint > "$STATE/net.fp" 2>/dev/null
+    return 0
+}
+
+guard_up() {
+    apply_guard 4 || { fail 'IPv4 端口防护安装失败'; return 1; }
+    apply_guard 6 || { fail 'IPv6 端口防护安装失败'; return 1; }
+}
+
+# ---------------------------------------------------------------- core lifecycle
+terminate_core() {
+    if core_alive; then
+        tc_pid=$core_pid
+        tc_start=$core_start
+        kill "$tc_pid" 2>/dev/null || :
+        tc_n=0
+        while pid_matches "$tc_pid" "$tc_start" && [ "$tc_n" -lt 50 ]; do
+            sleep 0.1
+            tc_n=$((tc_n + 1))
+        done
+        if pid_matches "$tc_pid" "$tc_start"; then kill -9 "$tc_pid" 2>/dev/null || :; sleep 0.2; fi
+    fi
+    rm -f "$PIDFILE" "$IDENTITY"
+}
+
+terminate_watch() {
+    # Invalidate the session before signalling; a later session is distinct.
+    rm -f "$TOKENFILE"
+    if watch_alive && [ "$watch_pid" != "$$" ]; then kill "$watch_pid" 2>/dev/null || :; fi
+    rm -f "$WATCHPID" "$WATCHIDENTITY"
+}
+
+ensure_watchdog() {
+    watch_alive && return 0
+    core_alive || return 1
+    ew_session="$(now).$$.$core_start"
+    printf '%s\n' "$ew_session" > "$TOKENFILE.tmp.$$" && mv -f "$TOKENFILE.tmp.$$" "$TOKENFILE" || return 1
+    setsid /system/bin/sh "$SELF" watch "$ew_session" "$core_pid" "$core_start" </dev/null >/dev/null 2>&1 9>&- 8>&- &
+    ew_n=0
+    while [ "$ew_n" -lt 30 ]; do
+        watch_alive && return 0
+        sleep 0.1
+        ew_n=$((ew_n + 1))
+    done
+    return 1
+}
+
+stop_service() {
+    # Remove interception first, so existing clients immediately regain direct routing.
+    if ! cleanup_network; then
+        fail '无法移除全部自有网络规则；内核保持运行，请重试停止。'
+        return 1
+    fi
+    terminate_watch
+    terminate_core
+    log 'Stopped; own interception, guard and policy routes removed.'
+    say '猫猫已停止（DNS、AGH 和 Tailscale 保持原状）'
+}
+
+foreign_core() {
+    ls -l /proc/[0-9]*/exe 2>/dev/null | grep -qF -- "-> $CORE"
+}
+
+preflight() {
+    for pf_cmd in iptables ip6tables iptables-restore ip6tables-restore ip flock setsid readlink awk sed; do
+        command -v "$pf_cmd" >/dev/null 2>&1 || { fail "缺少命令：$pf_cmd"; return 1; }
+    done
+    [ -x "$CORE" ] || { fail '内核不存在或没有执行权限'; return 1; }
+    [ -s "$CONFIG" ] || [ -s "$SOURCE" ] || { fail '尚未导入配置，请先添加订阅或上传配置'; return 1; }
+    ip link show "$LAN" >/dev/null 2>&1 || { fail '局域网网桥 br0 不存在'; return 1; }
+    if bound_port 1ED5 tcp || bound_port 1ED5 udp || bound_port 1ED2 tcp || bound_port 1E6C tcp; then
+        fail '端口 7890/7893/7788 已被占用'; return 1
+    fi
+    for pf_f in 4 6; do
+        pf_routes=$(ip "-$pf_f" route show table all 2>/dev/null) || { fail '无法读取路由表'; return 1; }
+        if printf '%s\n' "$pf_routes" | awk -v t="$TABLE" '{for (i = 1; i < NF; i++) if ($i == "table" && $(i+1) == t) found=1} END {exit !found}'; then
+            fail "IPv$pf_f 路由表 $TABLE 已被占用"; return 1
+        fi
+        pf_rules=$(ip "-$pf_f" rule show 2>/dev/null) || { fail '无法读取策略路由'; return 1; }
+        if printf '%s\n' "$pf_rules" | awk -v p="$PREF:" '$1 == p {found=1} END {exit !found}'; then
+            fail "IPv$pf_f 策略路由优先级 $PREF 已被占用"; return 1
+        fi
+    done
+    if ipt -t mangle -S "$CHAIN4" >/dev/null 2>&1 || ip6t -t mangle -S "$CHAIN6" >/dev/null 2>&1; then
+        fail '存在不属于本服务的代理链'; return 1
+    fi
+    if foreign_core; then fail '已有内核在运行但缺少本服务的进程记录'; return 1; fi
+    return 0
+}
+
+rotate_log() {
+    rl_size=$(fsize "$LOG")
+    numeric "$rl_size" || return 0
+    [ "$rl_size" -gt $((MM_LOG_MAX_KB * 1024)) ] || return 0
+    tail -c $((MM_LOG_MAX_KB * 256)) "$LOG" > "$LOG.1" 2>/dev/null
+    : > "$LOG"
+    own "$LOG.1"
+}
+
+start_service() {
+    load_settings
+    if [ "$1" = --auto ]; then
+        IFS= read -r ss_want 2>/dev/null < "$STATE/want" || ss_want=running
+        if [ "$ss_want" = stopped ]; then log 'Automatic start skipped: stopped by the user.'; return 0; fi
+    fi
+    if core_alive; then
+        if core_home_matches && network_ready && watch_alive && routes_ready; then say "猫猫已运行（PID $core_pid）"; return 0; fi
+        stop_service || return 1
+    else
+        cleanup_network || { fail '无法清理旧的透明代理规则（详见日志），请重试'; return 1; }
+        terminate_watch
+        rm -f "$PIDFILE" "$IDENTITY"
+    fi
+    migrate_home || { fail '无法迁移内核工作目录'; return 1; }
+    preflight || return 1
+    rotate_log
+    # Always regenerate from the filtered source, including configurations from the legacy layout.
+    if [ -s "$SOURCE" ]; then
+        ss_saved_prep=$PREP
+        # No downloads while holding the service lock: missing geodata fails fast instead.
+        if NO_GEO_DOWNLOAD=1 prepare_source "$SOURCE" > "$STATE/.start.$$" 2>&1; then
+            mv -f "$PREP/config.yaml" "$CONFIG" && own "$CONFIG"
+            rm -rf "$PREP"
+            PREP=$ss_saved_prep
+        else
+            PREP=$ss_saved_prep
+            cat "$STATE/.start.$$"
+            rm -f "$STATE/.start.$$"
+            fail '无法从源配置生成有效配置，网络规则未改变。'
+            return 1
+        fi
+        rm -f "$STATE/.start.$$"
+    elif ! ss_test=$(test_config "$CONFIG" 2>&1); then
+        out "$ss_test"
+        out "$ss_test" >> "$LOG"
+        fail '配置校验失败，网络规则未改变。'
+        return 1
+    fi
+    guard_up || { remove_guard 4; remove_guard 6; return 1; }
+    startup_pending=1
+    geo_lock
+    protect_ui
+    if [ "$MM_MEMLIMIT" != 0 ]; then
+        GOMEMLIMIT=${MM_MEMLIMIT}MiB setsid "$CORE" -d "$HOME_DIR" -f "$CONFIG" </dev/null >> "$LOG" 2>&1 9>&- 8>&- &
+    else
+        setsid "$CORE" -d "$HOME_DIR" -f "$CONFIG" </dev/null >> "$LOG" 2>&1 9>&- 8>&- &
+    fi
+    new_pid=$!
+    proc_stat "$new_pid" || { startup_pending=0; remove_guard 4; remove_guard 6; fail '内核启动后立即退出'; return 1; }
+    new_start=$ps_start
+    if ! printf '%s\n' "$new_pid" > "$PIDFILE" || ! printf '%s %s\n' "$new_pid" "$new_start" > "$IDENTITY"; then
+        pid_matches "$new_pid" "$new_start" && kill "$new_pid" 2>/dev/null
+        rm -f "$PIDFILE" "$IDENTITY"
+        startup_pending=0
+        fail '无法保存内核进程记录'
+        return 1
+    fi
+    printf '0\n' > "/proc/$new_pid/oom_score_adj" 2>/dev/null
+    ss_n=0
+    while [ "$ss_n" -lt 100 ]; do
+        if core_alive && listeners_ready; then break; fi
+        pid_matches "$new_pid" "$new_start" || break
+        sleep 0.2
+        ss_n=$((ss_n + 1))
+    done
+    if ! core_alive || ! listeners_ready; then
+        terminate_core
+        remove_guard 4; remove_guard 6
+        startup_pending=0
+        fail '内核未能打开 7890/7893/7788 端口，未安装透明代理规则；请查看日志。'
+        return 1
+    fi
+    if ! printf '%s\n' "$OWNER_TAG" > "$OWNER.tmp.$$" || ! mv -f "$OWNER.tmp.$$" "$OWNER" || ! owned; then
+        rm -f "$OWNER.tmp.$$" "$OWNER"
+        terminate_core
+        remove_guard 4; remove_guard 6
+        startup_pending=0
+        fail '无法保存防火墙所有权记录'
+        return 1
+    fi
+    # The watchdog exists before any interception hook is attached.
+    if ! ensure_watchdog; then rollback_startup; fail '守护进程启动失败'; return 1; fi
+    # LAN traffic stays direct (not black-holed) while providers load.
+    wait_providers
+    if ! net_up || ! core_alive; then rollback_startup; fail '透明代理规则安装失败，已回滚；请查看日志。'; return 1; fi
+    if ! watch_alive || ! core_alive; then rollback_startup; fail '内核或守护进程在启动过程中退出'; return 1; fi
+    rm -f "$STATE/last_error"
+    log "Started core PID $new_pid (v$SERVICE_VERSION; ipv6=$MM_IPV6 udp=$MM_UDP)."
+    startup_pending=0
+    printf '%s\n' "$(now)" > "$STATE/started"
+    printf 'running\n' > "$STATE/want"
+    say "猫猫已启动（PID $new_pid）"
+}
+
+rollback_startup() {
+    startup_pending=0
+    if cleanup_network; then
+        terminate_watch
+        terminate_core
+    else
+        # Never leave interception pointing at a deliberately killed core.
+        ensure_watchdog || :
+        log 'Rollback incomplete; core/watchdog retained; retry stop.'
+    fi
+}
+
+# Hot reload through the local controller; falls back to restart.
+api_call() {  # method path [json] -> body in $API_BODY_FILE, code in $api_code
+    ensure_secret || return 1
+    API_BODY_FILE=$STATE/.api.$$
+    if [ -n "$3" ]; then
+        api_code=$("$CURL" -sS --max-time "${API_TIMEOUT:-30}" -o "$API_BODY_FILE" -w '%{http_code}' -X "$1" \
+            -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' --data-binary "$3" "http://127.0.0.1:$CTRL_PORT$2" 2>/dev/null)
+    else
+        api_code=$("$CURL" -sS --max-time "${API_TIMEOUT:-30}" -o "$API_BODY_FILE" -w '%{http_code}' -X "$1" \
+            -H "Authorization: Bearer $SECRET" "http://127.0.0.1:$CTRL_PORT$2" 2>/dev/null)
+    fi
+}
+
+reload_core() {
+    core_alive || return 1
+    # The request returns once the new config is fully applied, including provider downloads.
+    rc_timeout=30
+    if [ "${sum_providers:-0}" = 1 ] || [ "${sum_rule_providers:-0}" = 1 ]; then rc_timeout=150; fi
+    # An omitted path reloads the -f file selected at startup. The explicit-path API rejects our
+    # config outside the isolated -d home; keep that filesystem boundary intact.
+    API_TIMEOUT=$rc_timeout api_call PUT '/configs?force=true' '{}'
+    rc_code=$api_code
+    rc_body=$(head -c 400 "$API_BODY_FILE" 2>/dev/null)
+    rm -f "$API_BODY_FILE"
+    if [ "$rc_code" = 204 ]; then log 'Configuration hot-reloaded.'; return 0; fi
+    log "Hot reload failed (HTTP ${rc_code:-none}): $rc_body"
+    return 1
+}
+
+# reload_or_restart: prints @reload=api|restart|stopped
+reload_or_restart() {
+    if ! core_alive; then kv reload stopped; return 0; fi
+    if reload_core; then kv reload api; return 0; fi
+    { stop_service && start_service; } > "$STATE/.rr.$$" 2>&1
+    rr_rc=$?
+    grep '^ERROR:' "$STATE/.rr.$$"
+    rm -f "$STATE/.rr.$$"
+    [ "$rr_rc" = 0 ] || return 1
+    kv reload restart
+}
+
+# ---------------------------------------------------------------- watchdog
+restart_budget_ok() {
+    rb_now=$(now)
+    rb_keep=
+    rb_count=0
+    if [ -r "$STATE/restarts" ]; then
+        while IFS= read -r rb_t; do
+            numeric "$rb_t" || continue
+            [ $((rb_now - rb_t)) -lt 600 ] || continue
+            rb_keep="$rb_keep$rb_t
+"
+            rb_count=$((rb_count + 1))
+        done < "$STATE/restarts"
+    fi
+    [ "$rb_count" -lt 3 ] || return 1
+    printf '%s%s\n' "$rb_keep" "$rb_now" > "$STATE/restarts"
+    RESTART_DELAY=$((3 + rb_count * rb_count * 7))
+    return 0
+}
+
+watch_service() {
+    ws_session=$1
+    ws_pid=$2
+    ws_start=$3
+    [ -n "$ws_session" ] && numeric "$ws_pid" && numeric "$ws_start" || return 1
+    IFS= read -r ws_tok 2>/dev/null < "$TOKENFILE" || return 0
+    [ "$ws_tok" = "$ws_session" ] || return 0
+    proc_stat "$$" || return 1
+    out "$$" > "$WATCHPID" && out "$$ $ps_start" > "$WATCHIDENTITY" || return 1
+    load_settings
+    ws_api_fail=0
+    # A private FIFO gives a builtin sleep (read -t) without forking every iteration.
+    ws_fifo=$STATE/.watch.$$.fifo
+    rm -f "$ws_fifo"
+    mkfifo -m 600 "$ws_fifo" 2>/dev/null || mknod "$ws_fifo" p 2>/dev/null
+    if [ -p "$ws_fifo" ]; then exec 3<>"$ws_fifo"; rm -f "$ws_fifo"; ws_sleep=fifo; else ws_sleep=fork; fi
+    ws_tick=0
+    ws_fail_wait=2
+    while :; do
+        IFS= read -r ws_tok 2>/dev/null < "$TOKENFILE" || ws_tok=
+        [ "$ws_tok" = "$ws_session" ] || return 0
+        if ! pid_matches "$ws_pid" "$ws_start"; then
+            watch_core_exited || { if [ "$ws_sleep" = fifo ]; then read -t "$ws_fail_wait" -u3 _; else sleep "$ws_fail_wait"; fi
+                ws_fail_wait=$((ws_fail_wait * 2)); [ "$ws_fail_wait" -le 60 ] || ws_fail_wait=60; continue; }
+            return 0
+        fi
+        ws_tick=$((ws_tick + 1))
+        if [ $((ws_tick % 15)) = 0 ]; then watch_periodic; fi
+        if [ "$ws_sleep" = fifo ]; then read -t 2 -u3 _; else sleep 2; fi
+    done
+}
+
+watch_core_exited() {
+    lock_service 30 || return 1
+    IFS= read -r ws_tok 2>/dev/null < "$TOKENFILE" || ws_tok=
+    if [ "$ws_tok" != "$ws_session" ] || pid_matches "$ws_pid" "$ws_start"; then unlock_service; return 0; fi
+    log 'Watchdog: core exited unexpectedly; removing transparent interception.'
+    if ! cleanup_network; then unlock_service; return 1; fi
+    rm -f "$PIDFILE" "$IDENTITY" "$TOKENFILE" "$WATCHPID" "$WATCHIDENTITY"
+    wc_tail=$(grep -E 'level=(error|fatal)|panic:|fatal error' "$LOG" 2>/dev/null | tail -n 3)
+    out "$(now) ${wc_tail:-内核意外退出}" > "$STATE/last_error"
+    unlock_service
+    if [ "$MM_AUTO_RESTART" = 1 ] && restart_budget_ok; then
+        log "Watchdog: automatic restart in ${RESTART_DELAY}s."
+        sleep "$RESTART_DELAY"
+        # start --auto re-reads the wanted state after taking the lock, so a stop issued meanwhile wins.
+        setsid /system/bin/sh "$SELF" start --auto </dev/null >/dev/null 2>&1 &
+    elif [ "$MM_AUTO_RESTART" = 1 ]; then
+        log 'Watchdog: restart limit reached (3 in 10 min); staying stopped, direct routing restored.'
+        out "$(now) 内核 10 分钟内异常退出 3 次，已停止自动重启并恢复直连。${wc_tail:+ 最后错误：$wc_tail}" > "$STATE/last_error"
+    fi
+    return 0
+}
+
+watch_periodic() {
+    # Every ~30 s: settings changes, log size; every ~60 s: interception health, address changes,
+    # controller liveness and the scheduled subscription update.
+    load_settings
+    rotate_log
+    [ $((ws_tick % 30)) = 0 ] || return 0
+    wp_fp=$(net_fingerprint)
+    IFS= read -r wp_old 2>/dev/null < "$STATE/net.fp" || wp_old=
+    wp_need=0
+    [ "$wp_fp" != "$wp_old" ] && wp_need=1
+    if [ "$wp_need" = 0 ]; then
+        ipt -t mangle -C PREROUTING -i "$LAN" -p tcp -j "$CHAIN4" 2>/dev/null || wp_need=1
+        { ipt -C INPUT -j "$GUARD4" 2>/dev/null && ip6t -C INPUT -j "$GUARD6" 2>/dev/null; } || wp_need=1
+        routes_ready || wp_need=1
+    fi
+    if [ "$wp_need" = 1 ]; then
+        log 'Watchdog: addresses or rules changed; refreshing interception.'
+        setsid /system/bin/sh "$SELF" net-refresh --quiet </dev/null >/dev/null 2>&1 &
+    fi
+    # A hung core keeps interception installed while serving nothing: treat 5 silent minutes as a crash.
+    API_TIMEOUT=5 api_call GET /version
+    rm -f "$API_BODY_FILE"
+    # Only "no answer at all" counts; any HTTP status (even 401) proves the core is serving.
+    case "$api_code" in 000) ws_api_fail=$((ws_api_fail + 1)) ;; '') ;; *) ws_api_fail=0 ;; esac
+    if [ "$ws_api_fail" -ge 5 ]; then
+        log 'Watchdog: controller unresponsive for 5 minutes; terminating the core.'
+        kill -9 "$ws_pid" 2>/dev/null
+        ws_api_fail=0
+    fi
+    if [ "$MM_SUB_INTERVAL" != 0 ] && [ -n "$MM_SUB_ACTIVE" ]; then
+        IFS= read -r wp_next 2>/dev/null < "$STATE/sub.next" || wp_next=0
+        epoch_ok "$wp_next" || wp_next=0
+        tick
+        if [ "$T_NOW" -ge "$wp_next" ]; then
+            out "$((T_NOW + 1800))" > "$STATE/sub.next"
+            log 'Watchdog: scheduled subscription update.'
+            setsid /system/bin/sh "$SELF" job "auto$T_NOW" sub-update active </dev/null >/dev/null 2>&1 &
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------- apply / sources
+backup_config() {
+    bc_stamp=$(stamp)
+    [ -s "$CONFIG" ] && cp -p "$CONFIG" "$BACKUPS/config.$bc_stamp.yaml" 2>/dev/null
+    [ -s "$SOURCE" ] && cp -p "$SOURCE" "$BACKUPS/source.$bc_stamp.yaml" 2>/dev/null
+    prune "$BACKUPS" 'config.*.yaml' 10
+    prune "$BACKUPS" 'source.*.yaml' 10
+}
+
+prune() {  # prune <dir> <glob> <keep>: keep the newest entries; only ever removes "<dir>/<name>"
+    # -d lists directory operands themselves; without it ls prints their contents as bare names.
+    # shellcheck disable=SC2012
+    ls -1dt "$1"/$2 2>/dev/null | tail -n +$(($3 + 1)) | while IFS= read -r pr_f; do
+        pr_name=${pr_f#"$1"/}
+        case "$pr_name" in "$pr_f"|''|*/*|.|..) continue ;; esac
+        chattr -R -i "$pr_f" 2>/dev/null
+        rm -rf "$pr_f"
+    done
+}
+
+source_origin() { if [ -r "$STATE/source.origin" ]; then IFS= read -r so_o < "$STATE/source.origin"; outn "$so_o"; else outn manual; fi; }
+
+# prepare_source <raw-file>: build and validate a config in $PREP with the current settings.
+# Needs no lock (it may download geodata); the caller loads settings first.
+prepare_source() {
+    PREP=$(mktemp -d "$BASE/.apply.XXXXXX") || { fail '无法创建临时目录'; return 1; }
+    cp "$1" "$PREP/source.yaml" && own "$PREP/source.yaml" || { rm -rf "$PREP"; fail '无法读取源配置'; return 1; }
+    generate_config "$PREP/source.yaml" "$PREP/config.yaml" "$PREP" || { rm -rf "$PREP"; return 1; }
+    ensure_geodata || { rm -rf "$PREP"; return 1; }
+    test_config "$PREP/config.yaml" || { rm -rf "$PREP"; return 1; }
+}
+
+# commit_source <origin>: swap $PREP in and reload or restart; the caller holds the service lock.
+restore_prepared_source() {
+    if [ -f "$PREP/previous.config" ]; then mv -f "$PREP/previous.config" "$CONFIG"; else rm -f "$CONFIG"; fi
+    if [ -f "$PREP/previous.source" ]; then mv -f "$PREP/previous.source" "$SOURCE"; else rm -f "$SOURCE"; fi
+    out "$cm_previous_origin" > "$STATE/source.origin"
+}
+
+commit_source() {
+    cm_origin=$1
+    cm_previous_origin=$(source_origin)
+    backup_config
+    if { [ -e "$CONFIG" ] && ! cp -p "$CONFIG" "$PREP/previous.config"; } ||
+       { [ -e "$SOURCE" ] && ! cp -p "$SOURCE" "$PREP/previous.source"; }; then
+        rm -rf "$PREP"; fail '无法保存上一个配置，未应用新配置'; return 1
+    fi
+    if ! { mv -f "$PREP/source.yaml" "$SOURCE" && mv -f "$PREP/config.yaml" "$CONFIG"; }; then
+        restore_prepared_source
+        rm -rf "$PREP"; fail '替换配置失败，已恢复上一个配置'; return 1
+    fi
+    out "$cm_origin" > "$STATE/source.origin"
+    if ! reload_or_restart; then
+        cm_err='新配置启动失败，已恢复上一个配置。'
+        restore_prepared_source
+        if ! core_alive; then start_service >/dev/null 2>&1 || cm_err="$cm_err 恢复后启动也失败，请查看日志。"; else reload_core || :; fi
+        rm -rf "$PREP"
+        fail "$cm_err"
+        return 1
+    fi
+    rm -rf "$PREP"
+    kv proxies "$sum_proxies"; kv groups "$sum_groups"; kv rules "$sum_rules"
+    kv providers "$sum_providers"; kv dropped "$sum_dropped"; kv origin "$cm_origin"
+    return 0
+}
+
+# apply_source <raw-file> <origin>: validate without the lock, then commit under it.
+apply_source() {
+    load_settings
+    prepare_source "$1" || return 1
+    lock_service 60 || { rm -rf "$PREP"; fail '服务忙（另一个操作仍在进行），未应用新配置'; return 1; }
+    commit_source "$2"
+    as_rc=$?
+    unlock_service
+    return "$as_rc"
+}
+
+set_active_sub() {  # persist MM_SUB_ACTIVE under the lock so concurrent settings writers cannot revert it
+    lock_service 30 || { fail '服务忙，未能保存当前订阅'; return 1; }
+    load_settings
+    MM_SUB_ACTIVE=$1
+    write_settings
+    sa_rc=$?
+    unlock_service
+    return "$sa_rc"
+}
+
+check_source() {  # check <raw-file>: validate like apply, without replacing anything
+    load_settings
+    cs_work=$(mktemp -d "$BASE/.apply.XXXXXX") || { fail '无法创建临时目录'; return 1; }
+    case "$1" in "$UPLOADS"/*) take_upload "$1" "$cs_work/raw" || { rm -rf "$cs_work"; return 1; } ;; *) cp "$1" "$cs_work/raw" || { rm -rf "$cs_work"; fail '无法读取文件'; return 1; } ;; esac
+    generate_config "$cs_work/raw" "$cs_work/config.yaml" "$cs_work" || { rm -rf "$cs_work"; return 1; }
+    if [ "$sum_geosite" = 1 ] && [ ! -s "$GEOSITE" ]; then say '提示：配置使用 GEOSITE 规则，应用时会自动下载 GeoSite.dat'; fi
+    if [ "$sum_asn" = 1 ] && [ ! -s "$ASN" ]; then say '提示：配置使用 IP-ASN 规则，应用时会自动下载 ASN.mmdb'; fi
+    ln -f "$CORE" "$cs_work/core.check" 2>/dev/null || cp "$CORE" "$cs_work/core.check"
+    cs_rc=0
+    if { [ "$sum_geosite" = 1 ] && [ ! -s "$GEOSITE" ]; } || { [ "$sum_asn" = 1 ] && [ ! -s "$ASN" ]; }; then
+        say '跳过内核校验（缺少规则数据文件）'
+    else
+        test_config "$cs_work/config.yaml" "$cs_work/core.check" || cs_rc=1
+    fi
+    rm -rf "$cs_work"
+    kv proxies "$sum_proxies"; kv groups "$sum_groups"; kv rules "$sum_rules"; kv providers "$sum_providers"; kv dropped "$sum_dropped"
+    [ "$cs_rc" = 0 ] && kv check ok
+    return "$cs_rc"
+}
+
+regen() {  # rebuild config.yaml from source.yaml with current settings
+    [ -s "$SOURCE" ] || { [ -s "$CONFIG" ] || { kv regen none; return 0; }; migrate_source || return 1; }
+    apply_source "$SOURCE" "$(source_origin)"
+}
+
+migrate_source() {
+    # v1 kept only the normalized config; its body is a valid source (header keys are dropped again).
+    [ -s "$SOURCE" ] && return 0
+    [ -s "$CONFIG" ] || return 1
+    cp -p "$CONFIG" "$SOURCE" && own "$SOURCE"
+    if [ ! -r "$STATE/source.origin" ]; then
+        if [ -s "$BASE/subscription.url" ] && [ ! -e "$SUBS/s1.url" ]; then
+            cp "$BASE/subscription.url" "$SUBS/s1.url" && own "$SUBS/s1.url"
+            mg_host=$(url_host "$SUBS/s1.url")
+            printf '%s\n' "${mg_host:-订阅1}" > "$SUBS/s1.name"
+            printf 'updated=%s\nstatus=ok\n' "$(stat -c %Y "$CONFIG" 2>/dev/null || now)" > "$SUBS/s1.meta"
+            cp -p "$CONFIG" "$SUBS/s1.yaml" 2>/dev/null
+            own "$SUBS"/s1.*
+            out 'sub:s1' > "$STATE/source.origin"
+            load_settings; MM_SUB_ACTIVE=s1; write_settings
+        else
+            printf 'manual\n' > "$STATE/source.origin"
+        fi
+    fi
+}
+
+ensure_geodata() {
+    migrate_home || { fail '无法迁移规则数据目录'; return 1; }
+    if [ "$sum_geosite" = 1 ] && [ ! -s "$GEOSITE" ]; then
+        [ "${NO_GEO_DOWNLOAD:-0}" = 1 ] && { fail '缺少 GeoSite.dat（GEOSITE 规则需要），请重新应用订阅或更新规则数据'; return 1; }
+        say '配置使用 GEOSITE 规则，正在下载 GeoSite.dat…'
+        fetch_meta_rules geosite.dat "$GEOSITE" || { fail '下载 GeoSite.dat 失败；GEOSITE 规则需要该文件'; return 1; }
+    fi
+    if [ "$sum_asn" = 1 ] && [ ! -s "$ASN" ]; then
+        [ "${NO_GEO_DOWNLOAD:-0}" = 1 ] && { fail '缺少 ASN.mmdb（IP-ASN 规则需要），请重新应用订阅或更新规则数据'; return 1; }
+        say '配置使用 IP-ASN 规则，正在下载 ASN.mmdb…'
+        fetch_meta_rules GeoLite2-ASN.mmdb "$ASN" || { fail '下载 ASN.mmdb 失败；IP-ASN 规则需要该文件'; return 1; }
+    fi
+    if [ "$sum_geoip" = 1 ] && [ ! -s "$GEOIP" ]; then
+        fail '缺少 GeoIP 数据（geoip.metadb），请重新安装内核组件'; return 1
+    fi
+    return 0
+}
+
+fetch_meta_rules() {  # asset dest
+    fm_json=$STATE/.release.$$.json
+    gh_release MetaCubeX/meta-rules-dat latest "$fm_json" >/dev/null || { rm -f "$fm_json"; return 1; }
+    fm_asset=$(gh_asset "$fm_json" "$1") || { rm -f "$fm_json"; return 1; }
+    rm -f "$fm_json"
+    download "${fm_asset%% *}" "$2.new" 280 67108864 >/dev/null || return 1
+    verify_sha "$2.new" "${fm_asset#* }" || { rm -f "$2.new"; return 1; }
+    own "$2.new"
+    chattr -i "$2" 2>/dev/null
+    if ! mv -f "$2.new" "$2"; then
+        chattr +i "$2" 2>/dev/null
+        rm -f "$2.new"
+        return 1
+    fi
+    chattr +i "$2" 2>/dev/null
+    return 0
+}
+
+# take_upload <path> <dest>: accept only a plain file directly inside the app upload dir or one of
+# our own work dirs (no "..", no subdirectories).
+take_upload() {
+    case "$1" in
+        "$UPLOADS"/*) tu_name=${1#"$UPLOADS"/} ;;
+        "$BASE"/.stage.*/*|"$BASE"/.apply.*/*)
+            tu_name=${1##*/}
+            tu_dir=${1%/*}
+            case "${tu_dir#"$BASE"/}" in */*|.|..|*..*) fail '文件路径无效'; return 1 ;; esac ;;
+        *) fail '文件路径无效'; return 1 ;;
+    esac
+    case "$tu_name" in *[!A-Za-z0-9_.-]*|''|.*) fail '文件名无效'; return 1 ;; esac
+    [ -f "$1" ] && [ ! -L "$1" ] || { fail '上传的文件不存在'; return 1; }
+    mv -f "$1" "$2" || { fail '无法移动上传的文件'; return 1; }
+    # Checked after the move: the destination directory is root-only, so this cannot race.
+    if [ -L "$2" ] || [ ! -f "$2" ]; then rm -f "$2"; fail '上传的文件类型无效'; return 1; fi
+    own "$2"
+}
+
+# ---------------------------------------------------------------- subscriptions
+sub_files() { SUB_URL=$SUBS/$1.url; SUB_NAME=$SUBS/$1.name; SUB_META=$SUBS/$1.meta; SUB_YAML=$SUBS/$1.yaml; }
+
+meta_get() {  # file key
+    [ -r "$1" ] || return 1
+    while IFS= read -r mg_line || [ -n "$mg_line" ]; do
+        case "$mg_line" in "$2="*) outn "${mg_line#*=}"; return 0 ;; esac
+    done < "$1"
+    return 1
+}
+
+url_host() { sed -n '1{s#^[a-zA-Z][a-zA-Z0-9+.-]*://\([^@/?#]*@\)\{0,1\}\([^/:?#]*\).*#\2#p;q}' "$1" 2>/dev/null | head -c 32; }
+meta_or() { meta_get "$1" "$2" || outn "$3"; }
+mask_url() { mu_h=$(url_host "$1"); mu_s=$(sed -n '1{s#^\([a-zA-Z][a-zA-Z0-9+.-]*\)://.*#\1#p;q}' "$1" 2>/dev/null); outn "$mu_s://$mu_h/…"; }
+
+sub_list() {
+    load_settings
+    for sl_f in "$SUBS"/*.url; do
+        [ -f "$sl_f" ] || continue
+        sl_id=${sl_f##*/}; sl_id=${sl_id%.url}
+        sub_id_ok "$sl_id" || continue
+        sub_files "$sl_id"
+        sl_name=$(head -c 96 "$SUB_NAME" 2>/dev/null | head -n 1)
+        sl_active=0
+        [ "$sl_id" = "$MM_SUB_ACTIVE" ] && sl_active=1
+        out "@sub id=$sl_id active=$sl_active updated=$(meta_or "$SUB_META" updated 0) status=$(meta_or "$SUB_META" status never) bytes=$(meta_or "$SUB_META" bytes 0) interval=$(meta_or "$SUB_META" interval 0) userinfo=$(meta_or "$SUB_META" userinfo '') name_b64=$(b64 "$sl_name") url_b64=$(b64 "$(mask_url "$SUB_URL")") error_b64=$(b64 "$(meta_or "$SUB_META" error '')")"
+    done
+    kv sub_active "$MM_SUB_ACTIVE"
+    kv sub_interval "$MM_SUB_INTERVAL"
+}
+
+# sub_save <id> <url-file> <name-file>
+sub_save() {
+    sub_id_ok "$1" || { fail '订阅编号无效'; return 1; }
+    sub_files "$1"
+    ss_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+    take_upload "$2" "$ss_work/url" || { rm -rf "$ss_work"; return 1; }
+    ss_url=$(head -c 2048 "$ss_work/url" | head -n 1 | tr -d '\r')
+    case "$ss_url" in http://?*|https://?*) ;; *) rm -rf "$ss_work"; fail '订阅地址必须以 http:// 或 https:// 开头'; return 1 ;; esac
+    case "$ss_url" in *[[:space:]]*|*\"*|*\'*|*\`*) rm -rf "$ss_work"; fail '订阅地址包含空白或引号'; return 1 ;; esac
+    printf '%s\n' "$ss_url" > "$SUB_URL.tmp" && own "$SUB_URL.tmp" && mv -f "$SUB_URL.tmp" "$SUB_URL"
+    if [ -n "$3" ]; then
+        take_upload "$3" "$ss_work/name" && head -c 96 "$ss_work/name" | head -n 1 | tr -d '\r\000' > "$SUB_NAME" && own "$SUB_NAME"
+    fi
+    [ -s "$SUB_NAME" ] || { printf '%s\n' "$(url_host "$SUB_URL")" > "$SUB_NAME"; own "$SUB_NAME"; }
+    [ -e "$SUB_META" ] || { printf 'status=never\n' > "$SUB_META"; own "$SUB_META"; }
+    rm -rf "$ss_work"
+    kv sub "$1"
+}
+
+sub_delete() {
+    sub_id_ok "$1" || { fail '订阅编号无效'; return 1; }
+    load_settings
+    sub_files "$1"
+    rm -f "$SUB_URL" "$SUB_NAME" "$SUB_META" "$SUB_YAML" "$SUBS/$1.headers"
+    if [ "$MM_SUB_ACTIVE" = "$1" ]; then set_active_sub '' || return 1; out manual > "$STATE/source.origin"; fi
+    kv deleted "$1"
+}
+
+meta_write() {  # id key=value...
+    mw_file=$SUBS/$1.meta
+    shift
+    mw_tmp=$mw_file.tmp.$$
+    : > "$mw_tmp"
+    for mw_kv in "$@"; do printf '%s\n' "$mw_kv" >> "$mw_tmp"; done
+    if [ -r "$mw_file" ]; then
+        while IFS= read -r mw_line || [ -n "$mw_line" ]; do
+            mw_key=${mw_line%%=*}
+            grep -q "^$mw_key=" "$mw_tmp" || printf '%s\n' "$mw_line" >> "$mw_tmp"
+        done < "$mw_file"
+    fi
+    own "$mw_tmp"
+    mv -f "$mw_tmp" "$mw_file"
+}
+
+# sub_update <id|active|all>: download, store, apply when active.
+sub_update() {
+    load_settings
+    case "$1" in
+        active) [ -n "$MM_SUB_ACTIVE" ] || { fail '没有正在使用的订阅'; return 1; }; su_ids=$MM_SUB_ACTIVE ;;
+        all) su_ids=; for su_f in "$SUBS"/*.url; do [ -f "$su_f" ] || continue; su_i=${su_f##*/}; su_ids="$su_ids ${su_i%.url}"; done ;;
+        *) sub_id_ok "$1" || { fail '订阅编号无效'; return 1; }; su_ids=$1 ;;
+    esac
+    su_failed=0
+    for su_id in $su_ids; do
+        sub_update_one "$su_id" || su_failed=1
+    done
+    if [ "$MM_SUB_INTERVAL" != 0 ]; then tick; out "$((T_NOW + MM_SUB_INTERVAL * 3600))" > "$STATE/sub.next"; fi
+    return "$su_failed"
+}
+
+sub_update_one() {
+    sub_files "$1"
+    [ -s "$SUB_URL" ] || { fail "订阅 $1 不存在"; return 1; }
+    su_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+    IFS= read -r su_url < "$SUB_URL"
+    say "更新订阅：$(head -c 64 "$SUB_NAME" 2>/dev/null | head -n 1)"
+    if ! DL_LABEL=$(mask_url "$SUB_URL") download "$su_url" "$su_work/raw" 90 "$MAX_SOURCE_BYTES" -A "$MM_SUB_UA" --compressed -D "$su_work/headers"; then
+        meta_write "$1" "status=error" "error=下载失败（直连/代理均未成功）" "checked=$(now)"
+        rm -rf "$su_work"
+        fail '订阅下载失败'
+        return 1
+    fi
+    su_size=$(fsize "$su_work/raw")
+    # Validate before keeping it as the last good copy.
+    if ! normalize "$su_work/raw" "$su_work/body" "$su_work/sum" >/dev/null 2>&1; then
+        su_err=$(sed -n 's/^@error=//p' "$su_work/sum" 2>/dev/null)
+        meta_write "$1" "status=error" "error=${su_err:-内容不是有效的 Clash 配置}" "checked=$(now)"
+        rm -rf "$su_work"; fail "订阅内容无效：${su_err:-内容不是有效的 Clash 配置}"; return 1
+    fi
+    su_info=$(tr -d '\r' < "$su_work/headers" | awk 'tolower($1) == "subscription-userinfo:" {sub(/^[^:]*:[ \t]*/, ""); v = $0} END {print v}' | tr -cd 'a-zA-Z0-9=;.' | head -c 200)
+    su_int=$(tr -d '\r' < "$su_work/headers" | awk 'tolower($1) == "profile-update-interval:" {print $2}' | tr -cd '0-9' | head -c 4)
+    mv -f "$su_work/raw" "$SUB_YAML.tmp" && own "$SUB_YAML.tmp" && mv -f "$SUB_YAML.tmp" "$SUB_YAML"
+    meta_write "$1" "status=ok" "error=" "updated=$(now)" "checked=$(now)" "bytes=$su_size" "userinfo=$su_info" "interval=${su_int:-0}" "via=$DL_VIA_USED"
+    rm -rf "$su_work"
+    kv updated "$1"; kv bytes "$su_size"; kv userinfo "$su_info"
+    if [ "$1" = "$MM_SUB_ACTIVE" ] || [ "${SUB_FORCE_APPLY:-0}" = 1 ]; then
+        apply_source "$SUB_YAML" "sub:$1"
+        su_rc=$?
+        [ "$su_rc" = 0 ] || meta_write "$1" "status=error" "error=已下载，但应用失败：${LAST_FAIL:-配置校验或启动失败}"
+        return "$su_rc"
+    fi
+    return 0
+}
+
+sub_use() {  # sub_use <id>: switch active subscription (download first if never fetched)
+    sub_id_ok "$1" || { fail '订阅编号无效'; return 1; }
+    sub_files "$1"
+    [ -s "$SUB_URL" ] || { fail '订阅不存在'; return 1; }
+    load_settings
+    if [ ! -s "$SUB_YAML" ]; then
+        SUB_FORCE_APPLY=1 sub_update_one "$1" || return 1
+    else
+        apply_source "$SUB_YAML" "sub:$1" || return 1
+    fi
+    set_active_sub "$1" || return 1
+    if [ "$MM_SUB_INTERVAL" != 0 ]; then tick; out "$((T_NOW + MM_SUB_INTERVAL * 3600))" > "$STATE/sub.next"; fi
+    kv sub_active "$1"
+}
+
+# ---------------------------------------------------------------- settings command
+settings_cmd() {  # settings <staged file from uploads>
+    st_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+    take_upload "$1" "$st_work/new" || { rm -rf "$st_work"; return 1; }
+    [ -s "$SOURCE" ] || migrate_source >/dev/null 2>&1
+    load_settings
+    for st_k in $SETTING_KEYS; do eval "st_old_$st_k=\$$st_k"; done
+    st_cr=$(printf '\r')
+    while IFS= read -r st_kv || [ -n "$st_kv" ]; do
+        st_kv=${st_kv%"$st_cr"}
+        [ -n "$st_kv" ] || continue
+        st_k=${st_kv%%=*}
+        st_v=${st_kv#*=}
+        case " $SETTING_KEYS " in *" $st_k "*) ;; *) rm -rf "$st_work"; fail "未知设置项：$st_k"; return 1 ;; esac
+        [ "$st_k" = MM_SUB_ACTIVE ] && continue
+        set_setting "$st_k" "$st_v" || { rm -rf "$st_work"; fail "设置项无效：$st_k"; return 1; }
+    done < "$st_work/new"
+    st_cfg=0; st_net=0
+    for st_k in MM_MODE MM_LOG_LEVEL MM_SNIFF MM_DNS MM_IPV6; do
+        eval "[ \"\$st_old_$st_k\" = \"\$$st_k\" ]" || st_cfg=1
+    done
+    for st_k in MM_GUARD_TS MM_IPV6 MM_UDP MM_QUIC_BLOCK MM_DEV_MODE MM_DEV_LIST MM_BYPASS_PORTS; do
+        eval "[ \"\$st_old_$st_k\" = \"\$$st_k\" ]" || st_net=1
+    done
+    PREP=
+    if [ "$st_cfg" = 1 ] && [ -s "$SOURCE" ]; then
+        # The new values are in effect in this shell only; settings.env still holds the old ones.
+        prepare_source "$SOURCE" || { rm -rf "$st_work"; fail '新设置生成的配置未通过校验，设置未保存'; return 1; }
+    fi
+    lock_service 30 || { [ -n "$PREP" ] && rm -rf "$PREP"; rm -rf "$st_work"; fail '服务忙（另一个操作仍在进行），设置未保存'; return 1; }
+    # MM_SUB_ACTIVE is not edited here: take the value currently on disk.
+    MM_SUB_ACTIVE=$(sed -n 's/^MM_SUB_ACTIVE=//p' "$SETTINGS" 2>/dev/null | head -n 1)
+    sub_id_ok "$MM_SUB_ACTIVE" || MM_SUB_ACTIVE=
+    st_previous_origin=$(source_origin)
+    if { [ -e "$SETTINGS" ] && ! cp -p "$SETTINGS" "$st_work/previous.settings"; } ||
+       { [ -e "$CONFIG" ] && ! cp -p "$CONFIG" "$st_work/previous.config"; } ||
+       { [ -e "$SOURCE" ] && ! cp -p "$SOURCE" "$st_work/previous.source"; }; then
+        unlock_service; [ -n "$PREP" ] && rm -rf "$PREP"; rm -rf "$st_work"
+        fail '无法保存原设置，设置未修改'; return 1
+    fi
+    write_settings || { unlock_service; [ -n "$PREP" ] && rm -rf "$PREP"; rm -rf "$st_work"; fail '保存设置失败'; return 1; }
+    st_running=0
+    core_alive && st_running=1
+    st_rc=0
+    if [ -n "$PREP" ]; then commit_source "$(source_origin)" || st_rc=1; fi
+    if core_alive && [ "$st_net" = 1 ]; then net_refresh_locked || st_rc=1; fi
+    if [ "$st_rc" != 0 ]; then
+        if [ -f "$st_work/previous.settings" ]; then mv -f "$st_work/previous.settings" "$SETTINGS"; else rm -f "$SETTINGS"; fi
+        if [ -f "$st_work/previous.config" ]; then mv -f "$st_work/previous.config" "$CONFIG"; else rm -f "$CONFIG"; fi
+        if [ -f "$st_work/previous.source" ]; then mv -f "$st_work/previous.source" "$SOURCE"; else rm -f "$SOURCE"; fi
+        out "$st_previous_origin" > "$STATE/source.origin"
+        load_settings
+        if core_alive; then
+            net_refresh_locked || log 'Settings rollback: restoring network rules failed.'
+            reload_or_restart || log 'Settings rollback: restoring the core failed.'
+        elif [ "$st_running" = 1 ]; then
+            start_service || log 'Settings rollback: restarting the previous core failed.'
+        fi
+        unlock_service
+        rm -rf "$st_work"
+        fail '新设置未能生效，已恢复原设置；请查看日志'
+        return 1
+    fi
+    unlock_service
+    rm -rf "$st_work"
+    [ "$st_old_MM_MEMLIMIT" = "$MM_MEMLIMIT" ] || kv restart_needed 1
+    if [ "$MM_SUB_INTERVAL" != 0 ] && [ "$st_old_MM_SUB_INTERVAL" != "$MM_SUB_INTERVAL" ]; then
+        tick; out "$((T_NOW + MM_SUB_INTERVAL * 3600))" > "$STATE/sub.next"
+    fi
+    kv config_changed "$st_cfg"; kv network_changed "$st_net"
+    return "$st_rc"
+}
+
+net_refresh_locked() {
+    owned || return 0
+    core_alive || return 0
+    load_settings
+    guard_up && net_up
+}
+
+lan_config_refresh() {  # the explicit-proxy allowlist follows the LAN addresses (IPv6 prefix changes)
+    [ -s "$SOURCE" ] && [ -s "$CONFIG" ] && core_alive || return 0
+    lc_want="lan-allowed-ips: $(lan_allowed)"
+    grep -qxF -- "$lc_want" "$CONFIG" && return 0
+    log 'LAN addresses changed; regenerating the configuration.'
+    regen >/dev/null 2>&1 || log "Regeneration failed: $LAST_FAIL"
+}
+
+mode_cmd() {  # persist the proxy mode and switch the running core without a reload
+    case "$1" in rule|global|direct) ;; *) fail '模式无效'; return 1 ;; esac
+    lock_service 30 || { fail '服务忙（另一个操作仍在进行），模式未修改'; return 1; }
+    load_settings
+    MM_MODE=$1
+    write_settings || { unlock_service; fail '保存设置失败'; return 1; }
+    [ -s "$CONFIG" ] && sed -i "s/^mode: .*/mode: $1/" "$CONFIG"
+    mc_rc=0
+    if core_alive; then
+        API_TIMEOUT=10 api_call PATCH /configs "{\"mode\":\"$1\"}"
+        [ "$api_code" = 204 ] || { fail "切换运行模式失败（HTTP ${api_code:-无响应}）"; mc_rc=1; }
+        rm -f "$API_BODY_FILE"
+    fi
+    unlock_service
+    kv mode "$1"
+    return "$mc_rc"
+}
+
+# ---------------------------------------------------------------- autostart
+autostart_on() { [ -r "$BOOT" ] && grep -qF -- "$BOOT_TAG" "$BOOT"; }
+
+autostart_set() {  # on|off
+    ensure_dirs
+    if [ ! -e "$BOOT" ]; then printf '#!/system/bin/sh\n' > "$BOOT" || { fail '无法创建开机脚本'; return 1; }; fi
+    cp -p "$BOOT" "$BACKUPS/boot.$(stamp).sh" 2>/dev/null
+    prune "$BACKUPS" 'boot.*.sh' 5
+    sed -i "/ $BOOT_TAG\$/d" "$BOOT" || { fail '无法修改开机脚本'; return 1; }
+    if [ "$1" = on ]; then printf '%s\n' "$BOOT_LINE" >> "$BOOT" || { fail '无法写入开机脚本'; return 1; }; fi
+    if autostart_on; then kv autostart 1; else kv autostart 0; fi
+}
+
+boot_cmd() {
+    if [ "$1" != --child ]; then
+        setsid /system/bin/sh "$SELF" boot --child </dev/null >>"$LOG" 2>&1 &
+        return 0
+    fi
+    exec 8>"$STATE/boot.lock"
+    flock -n -x 8 8>&8 || return 0
+    : > "$STATE/.boot.start"
+    log 'Boot: waiting for br0 and a sane clock.'
+    bt_n=0
+    while [ "$bt_n" -lt 90 ]; do
+        bt_year=$(date +%Y)
+        if ip -4 -o addr show dev "$LAN" 2>/dev/null | grep -q inet && [ "$bt_year" -ge 2025 ]; then break; fi
+        sleep 2
+        bt_n=$((bt_n + 1))
+    done
+    for bt_try in 1 2 3; do
+        if [ "$STATE/want" -nt "$STATE/.boot.start" ]; then
+            IFS= read -r bt_want 2>/dev/null < "$STATE/want" || bt_want=
+            [ "$bt_want" = stopped ] && { log 'Boot: stopped by the user meanwhile; not starting.'; return 0; }
+        fi
+        lock_service 60 || { sleep 20; continue; }
+        if start_service; then unlock_service; log "Boot: started (attempt $bt_try)."; return 0; fi
+        unlock_service
+        log "Boot: start attempt $bt_try failed: $LAST_FAIL"
+        sleep 20
+    done
+    out "$(now) 开机自动启动失败（已重试 3 次）：$LAST_FAIL" > "$STATE/last_error"
+    return 1
+}
+
+# ---------------------------------------------------------------- jobs
+job_id_ok() { case "$1" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac; [ "${#1}" -le 40 ]; }
+
+job_cmd() {  # job <id> <command...>: run detached; result in jobs/<id>.rc, output in jobs/<id>.log
+    job_id_ok "$1" || { fail '任务编号无效'; return 1; }
+    jc_id=$1
+    shift
+    ensure_dirs
+    prune "$JOBS" '*.log' 12
+    prune "$JOBS" '*.rc' 12
+    rm -f "$JOBS/$jc_id.rc"
+    : > "$JOBS/$jc_id.log"
+    setsid /system/bin/sh "$SELF_RUN" job-run "$jc_id" "$@" </dev/null >>"$JOBS/$jc_id.log" 2>&1 9>&- &
+    kv job "$jc_id"
+}
+
+job_run() {
+    jr_id=$1
+    shift
+    jr_rc_file=$JOBS/$jr_id.rc
+    exec 8>"$JOBLOCK"
+    if ! flock -n -x 8 8>&8; then
+        say '已有安装或订阅任务正在进行，请稍后重试。'
+        printf '75\n' > "$jr_rc_file"
+        return 75
+    fi
+    JOB_RC_FILE=$jr_rc_file
+    say "任务开始：$*（$(date '+%H:%M:%S')）"
+    dispatch "$@"
+}
+
+job_status() {  # job-status <id> [wait-seconds]: long-poll until done or timeout
+    job_id_ok "$1" || { fail '任务编号无效'; return 1; }
+    js_wait=${2:-20}
+    numeric "$js_wait" && [ "$js_wait" -le 60 ] || js_wait=20
+    js_n=0
+    while [ ! -s "$JOBS/$1.rc" ] && [ "$js_n" -lt $((js_wait * 4)) ]; do sleep 0.25; js_n=$((js_n + 1)); done
+    if [ -s "$JOBS/$1.rc" ]; then IFS= read -r js_rc < "$JOBS/$1.rc"; kv job_state 'done'; kv job_rc "$js_rc"; else kv job_state running; fi
+    kv job_log_b64 "$(tail -n 40 "$JOBS/$1.log" 2>/dev/null | tail -c 6000 | base64 -w 0)"
+}
+
+# ---------------------------------------------------------------- install
+core_candidate_ok() {  # path -> validates ELF/arch/version; sets CAND_VERSION
+    cc_size=$(fsize "$1")
+    numeric "$cc_size" && [ "$cc_size" -gt 1048576 ] && [ "$cc_size" -le "$MAX_CORE_BYTES" ] || { fail '内核文件大小无效（1 MB–128 MB）'; return 1; }
+    cc_head=$(od -An -v -tx1 -N20 "$1" | tr -d ' \n')
+    case "$cc_head" in 7f454c46020101*) ;; *) fail '不是 64 位小端 ELF 可执行文件'; return 1 ;; esac
+    cc_mach=${cc_head#????????????????????????????????????}
+    [ "${cc_mach%"${cc_mach#????}"}" = b700 ] || { fail '内核架构错误：需要 AArch64（Android arm64-v8）'; return 1; }
+    chmod 700 "$1"
+    CAND_VERSION=$(mm_timeout 15 "$1" -v 2>&1 | head -n 1)
+    case "$CAND_VERSION" in *Mihomo*) ;; *) fail "内核无法运行或不是 Mihomo：$CAND_VERSION"; return 1 ;; esac
+    case "$CAND_VERSION" in *android\ arm64*) ;; *) fail '请使用官方 Android arm64-v8 版本内核'; return 1 ;; esac
+    return 0
+}
+
+geo_candidate_ok() {  # core geo-file workdir
+    gv_dir=$3/geo-test
+    mkdir -m 700 "$gv_dir" || return 1
+    ln -s "$2" "$gv_dir/geoip.metadb" || return 1
+    printf '%s\n' 'geodata-mode: false' 'geox-url:' '  mmdb: "http://127.0.0.1:9/disabled"' 'rules:' '  - GEOIP,CN,DIRECT' '  - MATCH,DIRECT' > "$gv_dir/config.yaml"
+    mm_timeout 30 "$1" -t -d "$gv_dir" -f "$gv_dir/config.yaml" >/dev/null 2>&1
+    gv_rc=$?
+    rm -rf "$gv_dir"
+    [ "$gv_rc" = 0 ] || { fail 'GeoIP 数据无法被内核解析'; return 1; }
+}
+
+# install --stage DIR [--core keep|pinned|url|file] [--core-url U] [--core-sha S] [--core-file F] [--geo keep|pinned|file] [--geo-file F] [--geo-sha S] [--tag T]
+install_cmd() {
+    install_main "$@"
+    im_rc=$?
+    geo_lock
+    protect_ui
+    case "${ic_stage#"$BASE"/}" in .stage.?*) case "$ic_stage" in */*/*/*/*|*..*) ;; *) rm -rf "$ic_stage" ;; esac ;; esac
+    return "$im_rc"
+}
+
+install_main() {
+    ic_stage=; ic_core=auto; ic_core_url=; ic_core_sha=; ic_core_file=; ic_geo=auto; ic_geo_file=; ic_geo_sha=; ic_tag=; ic_keep_core=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --stage) ic_stage=$2; shift 2 ;;
+            --core) ic_core=$2; shift 2 ;;
+            --core-url) ic_core_url=$2; shift 2 ;;
+            --core-sha) ic_core_sha=$2; shift 2 ;;
+            --core-file) ic_core_file=$2; shift 2 ;;
+            --geo) ic_geo=$2; shift 2 ;;
+            --geo-file) ic_geo_file=$2; shift 2 ;;
+            --geo-sha) ic_geo_sha=$2; shift 2 ;;
+            --tag) ic_tag=$2; shift 2 ;;
+            *) fail "未知参数：$1"; return 1 ;;
+        esac
+    done
+    [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] || { fail '此插件仅适用于 Android arm64 设备'; return 1; }
+    ic_rel=${ic_stage#"$BASE"/}
+    case "$ic_rel" in "$ic_stage"|*/*|*..*) fail '暂存目录无效'; return 1 ;; .stage.?*) ;; *) fail '暂存目录无效'; return 1 ;; esac
+    [ -d "$ic_stage" ] && [ ! -L "$ic_stage" ] || { fail '暂存目录无效'; return 1; }
+    for ic_f in Clash.Service normalize.awk index.html; do [ -s "$ic_stage/$ic_f" ] || { fail "暂存文件缺失：$ic_f"; return 1; }; done
+    /system/bin/sh -n "$ic_stage/Clash.Service" || { fail '新服务脚本语法检查失败'; return 1; }
+    ensure_dirs || { fail '无法创建目录'; return 1; }
+    own "$ic_stage"/*
+    load_settings
+    ic_work=$ic_stage/work
+    mkdir -m 700 -p "$ic_work"
+    say "安装组件：服务 $SERVICE_VERSION"
+    # 1. Core candidate.
+    case "$ic_core" in
+        auto) if [ -x "$CORE" ] && [ -s "$CORE" ]; then ic_core=keep; else ic_core=pinned; fi ;;
+    esac
+    ic_new_core=
+    case "$ic_core" in
+        keep)
+            [ -x "$CORE" ] || { fail '没有可保留的内核，请选择安装内核'; return 1; }
+            # Validate through a hard link so a concurrent preflight never sees a second $CORE process.
+            ln -f "$CORE" "$ic_work/core.keep" 2>/dev/null || cp -p "$CORE" "$ic_work/core.keep"
+            core_candidate_ok "$ic_work/core.keep" || return 1
+            ic_keep_core=$ic_work/core.keep
+            say "保留现有内核：$CAND_VERSION" ;;
+        pinned|url)
+            if [ "$ic_core" = pinned ]; then ic_core_url=$PINNED_CORE_URL; ic_core_sha=$PINNED_CORE_SHA; ic_tag=$PINNED_TAG; fi
+            ic_have=$(core_version)
+            if [ -x "$CORE" ] && [ -n "$ic_tag" ]; then case "$ic_have" in *" $ic_tag "*)
+                say "已安装 $ic_tag，跳过下载"
+                ln -f "$CORE" "$ic_work/core.keep" 2>/dev/null || cp -p "$CORE" "$ic_work/core.keep"
+                core_candidate_ok "$ic_work/core.keep" || return 1
+                ic_keep_core=$ic_work/core.keep
+                ic_core=keep ;;
+            esac; fi
+        ;;
+    esac
+    case "$ic_core" in
+        keep) ;;
+        pinned|url)
+            case "$ic_core_url" in https://github.com/MetaCubeX/mihomo/releases/download/*) ;; *) fail '内核下载地址无效'; return 1 ;; esac
+            case "$ic_core_sha" in *[!0-9a-f]*|'') fail '缺少有效的 SHA-256'; return 1 ;; esac
+            [ "${#ic_core_sha}" = 64 ] || { fail '缺少有效的 SHA-256'; return 1; }
+            # A verified download survives a failed install so a retry need not fetch 20 MB again.
+            if [ -f "$BASE/.core.cache.gz" ] && [ "$(sha_of "$BASE/.core.cache.gz")" = "$ic_core_sha" ]; then
+                say '使用已校验的下载缓存'
+            else
+                rm -f "$BASE/.core.cache.gz"
+                download "$ic_core_url" "$BASE/.core.cache.gz" 280 67108864 || { fail '内核下载失败（直连/代理均未成功）；可使用“手动上传内核”'; return 1; }
+                verify_sha "$BASE/.core.cache.gz" "$ic_core_sha" || { rm -f "$BASE/.core.cache.gz"; fail '内核文件校验失败，未安装'; return 1; }
+            fi
+            mm_timeout 60 /system/bin/sh -c 'set -o pipefail; gzip -dc "$1" | head -c 134217729 > "$2"' sh "$BASE/.core.cache.gz" "$ic_work/core.new" ||
+                { fail '内核解压失败'; return 1; }
+            core_candidate_ok "$ic_work/core.new" || return 1
+            ic_new_core=$ic_work/core.new ;;
+        file)
+            [ -s "$ic_core_file" ] || { fail '没有上传内核文件'; return 1; }
+            take_upload "$ic_core_file" "$ic_work/core.upload" || return 1
+            if [ -z "$ic_core_sha" ]; then
+                ic_actual=$(sha_of "$ic_work/core.upload")
+                if [ "$ic_actual" = "$PINNED_CORE_SHA" ] || [ "$ic_actual" = "$PINNED_CORE_RAW_SHA" ]; then ic_core_sha=$ic_actual; else
+                    fail "内置 $PINNED_TAG 校验值不匹配；其他版本请填写官方 SHA-256（实际：$ic_actual）"; return 1; fi
+            fi
+            verify_sha "$ic_work/core.upload" "$ic_core_sha" || { fail '内核文件 SHA-256 不匹配，未安装'; return 1; }
+            if [ "$(od -An -tx1 -N3 "$ic_work/core.upload" | tr -d ' \n')" = 1f8b08 ]; then
+                mm_timeout 60 /system/bin/sh -c 'set -o pipefail; gzip -dc "$1" | head -c 134217729 > "$2"' sh "$ic_work/core.upload" "$ic_work/core.new" ||
+                    { fail '内核压缩包损坏，解压失败'; return 1; }
+                rm -f "$ic_work/core.upload"
+            else
+                mv -f "$ic_work/core.upload" "$ic_work/core.new"
+            fi
+            core_candidate_ok "$ic_work/core.new" || return 1
+            ic_new_core=$ic_work/core.new ;;
+        *) fail "未知内核来源：$ic_core"; return 1 ;;
+    esac
+    if [ -n "$ic_new_core" ] && [ -x "$CORE" ] && cmp -s "$ic_new_core" "$CORE"; then
+        say '新内核与当前内核相同，跳过替换'
+        rm -f "$ic_new_core"; ic_new_core=
+        ln -f "$CORE" "$ic_work/core.keep" 2>/dev/null || cp -p "$CORE" "$ic_work/core.keep"
+        ic_keep_core=$ic_work/core.keep
+    fi
+    ic_test_core=${ic_new_core:-$ic_keep_core}
+    # 2. GeoIP candidate.
+    migrate_home || { fail '无法迁移规则数据目录'; return 1; }
+    ic_new_geo=
+    case "$ic_geo" in
+        auto) if [ -s "$GEOIP" ]; then ic_geo=keep; else ic_geo=pinned; fi ;;
+    esac
+    case "$ic_geo" in
+        keep) [ -s "$GEOIP" ] || { fail '没有现有 GeoIP 数据，请同时上传 geoip.metadb'; return 1; } ;;
+        pinned)
+            download "$PINNED_GEO_URL" "$ic_work/geoip.new" 180 67108864 || { fail 'GeoIP 下载失败；可在手动上传窗口同时上传 geoip.metadb'; return 1; }
+            verify_sha "$ic_work/geoip.new" "$PINNED_GEO_SHA" || { fail 'GeoIP 校验失败'; return 1; }
+            ic_new_geo=$ic_work/geoip.new ;;
+        file)
+            take_upload "$ic_geo_file" "$ic_work/geoip.new" || return 1
+            verify_sha "$ic_work/geoip.new" "${ic_geo_sha:-$PINNED_GEO_SHA}" || { fail 'GeoIP 文件 SHA-256 不匹配'; return 1; }
+            ic_new_geo=$ic_work/geoip.new ;;
+        *) fail "未知 GeoIP 来源：$ic_geo"; return 1 ;;
+    esac
+    geo_candidate_ok "$ic_test_core" "${ic_new_geo:-$GEOIP}" "$ic_work" || return 1
+    # 3. Generate and test the configuration with the new normalizer/header and core.
+    lock_service 30 || { fail '服务忙，未开始配置迁移'; return 1; }
+    [ -s "$SOURCE" ] || migrate_source
+    unlock_service
+    load_settings
+    ic_source_sha=$(sha_of "$SOURCE")
+    ic_settings_sha=$(sha_of "$SETTINGS")
+    ic_new_config=
+    if [ -s "$SOURCE" ]; then
+        say '使用新组件重新生成并校验配置…'
+        NORMALIZER_OVERRIDE=$ic_stage/normalize.awk generate_config "$SOURCE" "$ic_work/config.yaml" "$ic_work" || return 1
+        ensure_geodata || return 1
+        # Validate against a scratch home holding the candidate GeoIP; live files stay untouched.
+        ic_home=$HOME_DIR
+        if [ -n "$ic_new_geo" ]; then
+            ic_home=$ic_work/home
+            mkdir -m 700 "$ic_home" && ln -s "$ic_new_geo" "$ic_home/geoip.metadb" || { fail '无法准备校验目录'; return 1; }
+            for ic_g in GeoSite.dat ASN.mmdb; do [ -f "$HOME_DIR/$ic_g" ] && ln -s "$HOME_DIR/$ic_g" "$ic_home/$ic_g"; done
+        fi
+        test_config "$ic_work/config.yaml" "$ic_test_core" "$ic_home" || return 1
+        ic_new_config=$ic_work/config.yaml
+    fi
+    # 4. Lock before backing up or changing the live tree. Validation may have downloaded data.
+    lock_service 180 || { fail '服务忙，请稍后重试'; return 1; }
+    if [ "$(sha_of "$SOURCE")" != "$ic_source_sha" ] || [ "$(sha_of "$SETTINGS")" != "$ic_settings_sha" ]; then
+        unlock_service; fail '配置或设置在校验期间发生变化，请重新安装'; return 1
+    fi
+    if [ -z "$ic_new_core" ] && ! cmp -s "$ic_keep_core" "$CORE"; then
+        unlock_service; fail '内核在校验期间发生变化，请重新安装'; return 1
+    fi
+    # Immutable files need independent backup inodes: pruning a hard link must never unlock live data.
+    ic_backup=$BACKUPS/update.$(stamp)-$$
+    mkdir -m 700 "$ic_backup" || { unlock_service; fail '无法创建备份目录'; return 1; }
+    for ic_pair in "core:$CORE" "geoip:$GEOIP" "service:$SELF" "normalizer:$NORMALIZER" "ui:$UI/index.html" "config:$CONFIG" "source:$SOURCE"; do
+        ic_name=${ic_pair%%:*}; ic_path=${ic_pair#*:}
+        [ -f "$ic_path" ] || continue
+        case "$ic_name" in
+            geoip|ui) cp -p "$ic_path" "$ic_backup/$ic_name" ;;
+            *) ln -f "$ic_path" "$ic_backup/$ic_name" 2>/dev/null || cp -p "$ic_path" "$ic_backup/$ic_name" ;;
+        esac || { rm -rf "$ic_backup"; unlock_service; fail '备份失败，未替换任何组件'; return 1; }
+    done
+    prune "$BACKUPS" 'update.*' 3
+    geo_lock
+    protect_ui
+    # 5. Swap, keeping the proxy running when only scripts/config change.
+    ic_running=0
+    core_alive && ic_running=1
+    ic_seamless=0
+    if [ "$ic_running" = 1 ] && [ -z "$ic_new_core" ] && core_home_matches; then
+        ic_ctl_old=$(controller_lines "$CONFIG")
+        ic_ctl_new=$(controller_lines "${ic_new_config:-$CONFIG}")
+        [ "$ic_ctl_old" = "$ic_ctl_new" ] && ic_seamless=1
+    fi
+    ic_changing=1
+    if [ "$ic_running" = 1 ] && [ "$ic_seamless" = 0 ]; then
+        say '停止当前代理以替换内核…'
+        stop_service || { unlock_service; fail '无法停止当前代理，未替换任何文件'; return 1; }
+    fi
+    ic_ok=1
+    [ -z "$ic_new_geo" ] || geo_unlock
+    unprotect_ui
+    { [ -z "$ic_new_core" ] || mv -f "$ic_new_core" "$CORE"; } &&
+    { [ -z "$ic_new_geo" ] || mv -f "$ic_new_geo" "$GEOIP"; } &&
+    mv -f "$ic_stage/normalize.awk" "$NORMALIZER" &&
+    mv -f "$ic_stage/index.html" "$UI/index.html" &&
+    { [ -z "$ic_new_config" ] || mv -f "$ic_new_config" "$CONFIG"; } &&
+    mv -f "$ic_stage/Clash.Service" "$SELF" || ic_ok=0
+    OWN_MODE=700 own "$CORE" "$SELF"
+    own "$NORMALIZER" "$UI/index.html" "$CONFIG" "$GEOIP" "$SOURCE"
+    geo_lock
+    protect_ui
+    if [ "$ic_ok" = 1 ]; then
+        if [ "$ic_seamless" = 1 ]; then
+            say '平滑升级：保持内核运行，刷新规则并热重载配置…'
+            if net_refresh_locked && reload_core && { terminate_watch; ensure_watchdog; }; then
+                say '已平滑升级，代理未中断'
+            else
+                say '平滑升级失败，改为重启代理…'
+                { stop_service && start_service; } || ic_ok=0
+            fi
+        elif [ "$ic_running" = 1 ]; then
+            start_service || ic_ok=0
+        fi
+    fi
+    if [ "$ic_ok" != 1 ]; then
+        say '安装失败，正在恢复备份…'
+        core_alive && stop_service >/dev/null 2>&1
+        unprotect_ui
+        geo_unlock
+        for ic_pair in "core:$CORE" "geoip:$GEOIP" "service:$SELF" "normalizer:$NORMALIZER" "ui:$UI/index.html" "config:$CONFIG" "source:$SOURCE"; do
+            ic_name=${ic_pair%%:*}; ic_path=${ic_pair#*:}
+            [ -f "$ic_backup/$ic_name" ] && { ln -f "$ic_backup/$ic_name" "$ic_path.restore" 2>/dev/null || cp -p "$ic_backup/$ic_name" "$ic_path.restore"; } && mv -f "$ic_path.restore" "$ic_path"
+        done
+        geo_lock
+        protect_ui
+        rm -f "$STATE/core.version"
+        unlock_service
+        if [ "$ic_running" = 1 ]; then setsid /system/bin/sh "$SELF" start </dev/null >>"$LOG" 2>&1 & fi
+        fail "安装失败，已恢复备份：$ic_backup"
+        return 1
+    fi
+    ic_changing=0
+    rm -f "$BASE/.core.cache.gz" "$STATE/core.version" "$PROXY/core.version"
+    # Migrate a v1 autostart line to the v2 boot entry (waits for br0, retries).
+    if autostart_on && ! grep -qF -- "$BOOT_LINE" "$BOOT" 2>/dev/null; then autostart_set on >/dev/null; fi
+    unlock_service
+    rm -rf "$ic_stage"
+    ic_ver=$(core_version)
+    say "安装完成：$ic_ver"
+    kv installed 1
+    kv core_version "$ic_ver"
+    if core_alive; then kv running 1; else kv running 0; fi
+    kv seamless "$ic_seamless"
+    return 0
+}
+
+geo_update() {
+    gu_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+    gu_list='geoip.metadb:geoip.metadb'
+    migrate_home || { rm -rf "$gu_work"; fail '无法迁移规则数据目录'; return 1; }
+    [ -s "$GEOSITE" ] && gu_list="$gu_list GeoSite.dat:geosite.dat"
+    [ -s "$ASN" ] && gu_list="$gu_list ASN.mmdb:GeoLite2-ASN.mmdb"
+    gh_release MetaCubeX/meta-rules-dat latest "$gu_work/rel.json" >/dev/null || { rm -rf "$gu_work"; fail '无法获取规则数据版本信息'; return 1; }
+    gu_changed=0
+    for gu_pair in $gu_list; do
+        gu_file=${gu_pair%%:*}; gu_asset=${gu_pair#*:}
+        gu_a=$(gh_asset "$gu_work/rel.json" "$gu_asset") || { rm -rf "$gu_work"; fail "发布缺少 $gu_asset 或校验值"; return 1; }
+        if [ "$(sha_of "$HOME_DIR/$gu_file")" = "${gu_a#* }" ]; then say "$gu_file 已是最新"; continue; fi
+        download "${gu_a%% *}" "$gu_work/$gu_file" 280 67108864 || { rm -rf "$gu_work"; fail "$gu_file 下载失败"; return 1; }
+        verify_sha "$gu_work/$gu_file" "${gu_a#* }" || { rm -rf "$gu_work"; fail "$gu_file 校验失败"; return 1; }
+        if [ "$gu_file" = geoip.metadb ] && [ -x "$CORE" ]; then
+            ln -f "$CORE" "$gu_work/core.test" 2>/dev/null || cp "$CORE" "$gu_work/core.test"
+            geo_candidate_ok "$gu_work/core.test" "$gu_work/$gu_file" "$gu_work" || { rm -rf "$gu_work"; return 1; }
+        fi
+        gu_changed=1
+    done
+    if [ "$gu_changed" = 0 ]; then rm -rf "$gu_work"; kv geo_updated 0; return 0; fi
+    lock_service 60 || { rm -rf "$gu_work"; fail '服务忙（另一个操作仍在进行）'; return 1; }
+    geo_unlock
+    for gu_pair in $gu_list; do
+        gu_file=${gu_pair%%:*}
+        [ -s "$gu_work/$gu_file" ] || continue
+        own "$gu_work/$gu_file"
+        if ! mv -f "$gu_work/$gu_file" "$HOME_DIR/$gu_file"; then
+            geo_lock
+            unlock_service
+            rm -rf "$gu_work"
+            fail "$gu_file 替换失败"
+            return 1
+        fi
+        say "已更新 $gu_file"
+    done
+    geo_lock
+    gu_rc=0
+    if core_alive; then reload_core || { stop_service && start_service; } || gu_rc=1; fi
+    unlock_service
+    rm -rf "$gu_work"
+    kv geo_updated 1
+    return "$gu_rc"
+}
+
+controller_lines() {
+    awk '/^(external-controller|external-ui|secret|bind-address|allow-lan|mixed-port|tproxy-port):/ {print; next} /^external-controller-cors:/ {c=1; print; next} c && /^  / {print; next} {c=0}' "$1" 2>/dev/null
+}
+
+core_latest() {
+    cl_json=$STATE/.release.$$.json
+    gh_release MetaCubeX/mihomo latest "$cl_json" >/dev/null || { rm -f "$cl_json"; fail '无法获取 GitHub 最新版本信息'; return 1; }
+    cl_tag=$("$JQ" -r '.tag_name // ""' "$cl_json" 2>/dev/null)
+    case "$cl_tag" in v[0-9]*) ;; *) rm -f "$cl_json"; fail '版本信息无效'; return 1 ;; esac
+    case "$cl_tag" in *[!A-Za-z0-9._-]*) rm -f "$cl_json"; fail '版本信息无效'; return 1 ;; esac
+    cl_asset=$(gh_asset "$cl_json" "mihomo-android-arm64-v8-$cl_tag.gz") || { rm -f "$cl_json"; fail '最新版本缺少 Android arm64-v8 安装包或校验值'; return 1; }
+    cl_date=$("$JQ" -r '.published_at // ""' "$cl_json" 2>/dev/null | tr -cd '0-9TZ:-')
+    rm -f "$cl_json"
+    kv tag "$cl_tag"; kv url "${cl_asset%% *}"; kv sha "${cl_asset#* }"; kv published "$cl_date"
+    kv current "$(core_version)"
+}
+
+dashboard_install() {  # dashboard-install [pinned|latest]
+    ensure_dirs
+    load_settings
+    di_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+    if [ "${1:-pinned}" = latest ]; then
+        gh_release MetaCubeX/metacubexd latest "$di_work/rel.json" >/dev/null || { rm -rf "$di_work"; fail '无法获取面板版本信息'; return 1; }
+        di_asset=$(gh_asset "$di_work/rel.json" compressed-dist.tgz) || { rm -rf "$di_work"; fail '面板发布缺少校验值'; return 1; }
+        di_url=${di_asset%% *}; di_sha=${di_asset#* }
+        di_tag=$("$JQ" -r '.tag_name // ""' "$di_work/rel.json" | tr -cd 'A-Za-z0-9._-')
+    else
+        di_url=$PINNED_XD_URL; di_sha=$PINNED_XD_SHA; di_tag=$PINNED_XD_TAG
+    fi
+    download "$di_url" "$di_work/xd.tgz" 180 33554432 || { rm -rf "$di_work"; fail '面板下载失败'; return 1; }
+    verify_sha "$di_work/xd.tgz" "$di_sha" || { rm -rf "$di_work"; fail '面板校验失败'; return 1; }
+    mkdir -m 700 "$di_work/xd"
+    tar -xzf "$di_work/xd.tgz" -C "$di_work/xd" || { rm -rf "$di_work"; fail '面板解压失败'; return 1; }
+    [ -s "$di_work/xd/index.html" ] || { rm -rf "$di_work"; fail '面板文件结构无效'; return 1; }
+    # Served by the core: only plain files and directories, nothing pointing elsewhere.
+    if [ -n "$(find "$di_work/xd" ! -type f ! -type d 2>/dev/null | head -n 1)" ]; then rm -rf "$di_work"; fail '面板压缩包包含不允许的文件类型'; return 1; fi
+    lan_addr4
+    printf "window.__METACUBEXD_CONFIG__ = {\n  defaultBackendURL: 'http://%s:%s',\n  githubToken: '',\n}\n" "${LAN_ADDR4:-192.168.0.1}" "$CTRL_PORT" > "$di_work/xd/config.js"
+    chown -R 0:0 "$di_work/xd"
+    chmod -R go-rwx "$di_work/xd"
+    unprotect_ui
+    rm -rf "$UI/xd.old"
+    [ -d "$UI/xd" ] && mv "$UI/xd" "$UI/xd.old"
+    if ! mv "$di_work/xd" "$UI/xd"; then
+        [ -d "$UI/xd.old" ] && mv "$UI/xd.old" "$UI/xd"
+        protect_ui
+        rm -rf "$di_work"
+        fail '面板安装失败'
+        return 1
+    fi
+    rm -rf "$UI/xd.old" "$di_work"
+    protect_ui
+    out "$di_tag" > "$STATE/xd.version"
+    kv dashboard metacubexd; kv tag "$di_tag"
+}
+
+core_version() {  # cached outside the core's home; refreshed whenever the binary is newer
+    if [ -s "$STATE/core.version" ] && [ ! "$CORE" -nt "$STATE/core.version" ]; then
+        IFS= read -r cv_v < "$STATE/core.version"
+        out "$cv_v"
+        return
+    fi
+    [ -x "$CORE" ] || return 0
+    ln -f "$CORE" "$STATE/.core.v" 2>/dev/null || return 0
+    cv_v=$(mm_timeout 15 "$STATE/.core.v" -v 2>/dev/null | head -n 1)
+    rm -f "$STATE/.core.v"
+    case "$cv_v" in *Mihomo*) out "$cv_v" > "$STATE/core.version"; own "$STATE/core.version"; out "$cv_v" ;; esac
+}
+
+core_uptime() {  # seconds since the core started (starttime is in USER_HZ=100 ticks)
+    IFS=' ' read -r cu_up _ < /proc/uptime
+    cu_up=${cu_up%.*}
+    if [ "${#core_start}" -le 9 ]; then outn "$((cu_up - core_start / 100))"
+    else awk -v u="$cu_up" -v s="$core_start" 'BEGIN { printf "%d", u - s / 100 }'; fi
+}
+
+health_kv() {  # stale interception (core gone, rules still installed) and a missing watchdog; spawns a fix
+    hk_heal=0
+    if core_alive; then
+        if watch_alive; then kv watchdog 1; else kv watchdog 0; hk_heal=1; fi
+    elif owned; then
+        kv net_stale 1
+        # A live watchdog notices the exit within ~2 s and handles cleanup and auto-restart itself.
+        watch_alive || hk_heal=1
+    fi
+    if [ "$hk_heal" = 1 ] && ! service_busy; then
+        setsid /system/bin/sh "$SELF" heal </dev/null >/dev/null 2>&1 &
+    fi
+}
+
+heal_cmd() {
+    lock_service 5 || return 0
+    load_settings
+    if core_alive; then
+        if ! watch_alive; then ensure_watchdog && log 'Heal: watchdog restarted.'; fi
+    elif owned && ! watch_alive; then
+        log 'Heal: core not running but interception installed; restoring direct routing.'
+        if cleanup_network; then
+            terminate_watch
+            rm -f "$PIDFILE" "$IDENTITY"
+            out "$(now) 内核已退出（守护进程缺失），已自动恢复直连" > "$STATE/last_error"
+            IFS= read -r hl_want 2>/dev/null < "$STATE/want" || hl_want=running
+            if [ "$MM_AUTO_RESTART" = 1 ] && [ "$hl_want" = running ] && restart_budget_ok; then
+                log 'Heal: automatic restart.'
+                start_service >/dev/null 2>&1 || out "$(now) 自动重启失败：$LAST_FAIL" > "$STATE/last_error"
+            fi
+        fi
+    fi
+    unlock_service
+}
+
+# ---------------------------------------------------------------- info / diagnostics
+info_cmd() {
+    load_settings
+    kv service_version "$SERVICE_VERSION"
+    if service_busy; then kv busy 1; else kv busy 0; fi
+    if core_alive; then
+        kv state running; kv pid "$core_pid"
+        kv uptime "$(core_uptime)"
+        ic_rss=0
+        while IFS= read -r ic_l; do case "$ic_l" in VmRSS:*) ic_rss=${ic_l#VmRSS:}; ic_rss=${ic_rss% kB}; ic_rss=${ic_rss##* } ;; esac; done < "/proc/$core_pid/status"
+        kv rss_kb "$ic_rss"
+        if network_ready; then kv network 1; else kv network 0; fi
+    else
+        kv state stopped
+    fi
+    health_kv
+    if [ -x "$CORE" ] && [ -s "$CORE" ]; then kv core present; elif [ -e "$CORE" ]; then kv core notexec; else kv core missing; fi
+    kv core_version "$(core_version)"
+    [ -s "$CONFIG" ] && kv config present || kv config missing
+    [ -s "$SOURCE" ] && kv source present || kv source missing
+    kv source_origin "$(source_origin)"
+    [ -s "$GEOIP" ] || [ -s "$PROXY/geoip.metadb" ] && kv geoip present || kv geoip missing
+    [ -s "$UI/xd/index.html" ] && kv dashboard_xd "$(head -n 1 "$STATE/xd.version" 2>/dev/null || outn installed)"
+    if autostart_on; then kv autostart 1; else kv autostart 0; fi
+    for ic_k in $SETTING_KEYS; do eval "kv \"\$ic_k\" \"\$$ic_k\""; done
+    if [ -r "$STATE/last_error" ]; then kv last_error_b64 "$(head -c 1200 "$STATE/last_error" | base64 -w 0)"; fi
+    if [ -n "$MM_SUB_ACTIVE" ]; then
+        sub_files "$MM_SUB_ACTIVE"
+        kv sub_name_b64 "$(b64 "$(head -c 96 "$SUB_NAME" 2>/dev/null | head -n 1)")"
+        kv sub_updated "$(meta_or "$SUB_META" updated 0)"
+        kv sub_status "$(meta_or "$SUB_META" status never)"
+        kv sub_userinfo "$(meta_or "$SUB_META" userinfo '')"
+        IFS= read -r ic_next 2>/dev/null < "$STATE/sub.next" || ic_next=0
+        kv sub_next "$ic_next"
+    fi
+    kv now "$(now)"
+}
+
+live_cmd() {
+    load_settings
+    kv service_version "$SERVICE_VERSION"
+    if service_busy; then kv busy 1; else kv busy 0; fi
+    if core_alive; then
+        kv state running; kv pid "$core_pid"
+        kv uptime "$(core_uptime)"
+        while IFS= read -r lc_l; do case "$lc_l" in VmRSS:*) lc_l=${lc_l#VmRSS:}; lc_l=${lc_l% kB}; kv rss_kb "${lc_l##* }" ;; esac; done < "/proc/$core_pid/status"
+        API_TIMEOUT=4 api_call GET /connections
+        if [ "$api_code" = 200 ]; then
+            "$JQ" -r '"@conns=\(.connections | length)", "@up_total=\(.uploadTotal)", "@down_total=\(.downloadTotal)", "@mem=\(.memory // 0)"' "$API_BODY_FILE" 2>/dev/null
+        fi
+        API_TIMEOUT=4 api_call GET /configs
+        [ "$api_code" = 200 ] && "$JQ" -r '"@mode=\(.mode)"' "$API_BODY_FILE" 2>/dev/null
+        rm -f "$API_BODY_FILE"
+    else
+        kv state stopped
+    fi
+    health_kv
+    if [ -x "$CORE" ] && [ -s "$CORE" ]; then kv core present; elif [ -e "$CORE" ]; then kv core notexec; else kv core missing; fi
+    [ -s "$CONFIG" ] && kv config present || kv config missing
+    kv MM_MODE "$MM_MODE"
+    [ -r "$STATE/last_error" ] && kv last_error_b64 "$(head -c 1200 "$STATE/last_error" | base64 -w 0)"
+    if [ -n "$MM_SUB_ACTIVE" ]; then
+        sub_files "$MM_SUB_ACTIVE"
+        kv sub_userinfo "$(meta_or "$SUB_META" userinfo '')"
+        kv sub_updated "$(meta_or "$SUB_META" updated 0)"
+        kv sub_status "$(meta_or "$SUB_META" status never)"
+    fi
+    kv now "$(now)"
+}
+
+junk_list() {
+    # Leftovers of v1 and of interrupted operations (none of these belong to a running operation).
+    for jl_f in "$BASE"/.install-* "$BASE"/.subscription-* "$BASE"/.subscription.* "$BASE"/.install.log "$BASE"/.install.rc \
+        "$BASE"/.core.gz "$BASE"/.core.upload.* "$BASE"/.geoip.upload.* "$SCRIPTS"/.Clash.Service.* "$UI"/.index.html.* \
+        "$PROXY"/.config.new "$PROXY"/.validate.* "$PROXY"/.core.new "$PROXY"/.geoip.new "$PROXY"/.geoip.testing "$BASE"/.timeout.*.rc \
+        "$BASE"/start-trace.log "$BASE"/stop-trace.log "$BASE"/boot.log "$PROXY"/.config.previous "$PROXY"/core.version "$UI"/xd.version; do
+        [ -e "$jl_f" ] && out "$jl_f"
+    done
+    # Files from the v1 layout once the core's home holds its own copy.
+    if ! core_alive || core_home_matches; then
+        for jl_n in geoip.metadb GeoSite.dat ASN.mmdb cache.db; do
+            [ -f "$PROXY/$jl_n" ] && [ -s "$HOME_DIR/$jl_n" ] && out "$PROXY/$jl_n"
+        done
+        [ -d "$PROXY/ui" ] && [ -s "$UI/index.html" ] && out "$PROXY/ui"
+        [ -d "$PROXY/providers" ] && out "$PROXY/providers"
+    fi
+    if [ -d "$BASE/ui" ] && ! grep -q "external-ui: \"$BASE/ui\"" "$CONFIG" 2>/dev/null; then out "$BASE/ui"; fi
+    if [ -f "$BASE/subscription.url" ] && [ -f "$SUBS/s1.url" ] && cmp -s "$BASE/subscription.url" "$SUBS/s1.url"; then out "$BASE/subscription.url"; fi
+    # Temporary files are only stale once no operation can still be using them.
+    find "$STATE" -maxdepth 1 -type f \( -name '.timeout.*' -o -name '.rules.*' -o -name '.guard.*' -o -name '.api.*' \
+        -o -name '.release.*' -o -name '.core.test.*' -o -name '.core.v' -o -name '.rr.*' -o -name '.start.*' \) -mmin +10 2>/dev/null
+    find "$BASE" -maxdepth 1 \( -name '.apply.*' -o -name '.stage.*' -o -name '.core.cache.gz' \) -mmin +60 2>/dev/null
+}
+
+cleanup_cmd() {  # cleanup [--dry-run]
+    cu_before=$(du -sk "$BASE" 2>/dev/null | cut -f1)
+    if [ "$1" = --dry-run ]; then
+        junk_list | while IFS= read -r cu_f; do out "@junk $(du -sk "$cu_f" 2>/dev/null | cut -f1) $cu_f"; done
+        # shellcheck disable=SC2012
+        ls -1dt "$BACKUPS"/update.* 2>/dev/null | tail -n +4 | while IFS= read -r cu_f; do out "@backup $(du -sk "$cu_f" | cut -f1) $cu_f"; done
+        kv total_kb "$cu_before"
+        return 0
+    fi
+    exec 8>"$JOBLOCK"
+    flock -n -x 8 8>&8 || { fail '有任务正在运行，请稍后清理'; return 1; }
+    if ! lock_service 30; then
+        flock -u 8 8>&8
+        fail '服务忙，请稍后清理'; return 1
+    fi
+    unprotect_ui
+    junk_list | while IFS= read -r cu_f; do
+        case "$cu_f" in "$BASE"/?*) ;; *) continue ;; esac
+        case "$cu_f" in *..*) continue ;; esac
+        chattr -R -i "$cu_f" 2>/dev/null
+        rm -rf "$cu_f"
+    done
+    prune "$BACKUPS" 'update.*' 3
+    prune "$BACKUPS" 'config.*.yaml' 10
+    prune "$BACKUPS" 'source.*.yaml' 10
+    prune "$BACKUPS" 'boot.*.sh' 5
+    prune "$JOBS" '*.log' 12
+    prune "$JOBS" '*.rc' 12
+    # Legacy copies/backups may share live inodes from an earlier build.
+    geo_lock
+    protect_ui
+    unlock_service
+    flock -u 8 8>&8
+    cu_after=$(du -sk "$BASE" 2>/dev/null | cut -f1)
+    kv freed_kb "$((cu_before - cu_after))"
+    kv total_kb "$cu_after"
+}
+
+diag_cmd() {
+    load_settings
+    say "== 猫猫 TProxy Plus 诊断 $(date '+%Y-%m-%d %H:%M:%S')"
+    say "设备：$(getprop ro.product.model) $(getprop ro.build.display.id) ABI=$(getprop ro.product.cpu.abi) 内核=$(uname -r)"
+    say "服务：$SERVICE_VERSION 内核：$(core_version)"
+    info_cmd | grep -v -E '^@(secret|sub_name_b64|last_error_b64)='
+    say "== 监听端口"
+    for dp in 1ED2 1ED5 1E6C; do for dt in tcp udp; do bound_port "$dp" "$dt" && say "$((0x$dp))/$dt 已监听"; done; done
+    say "== IPv4 mangle"; ipt -t mangle -S 2>&1 | grep -E 'UFI_MM|PREROUTING'
+    say "== IPv6 mangle"; ip6t -t mangle -S 2>&1 | grep -E 'UFI_MM|PREROUTING'
+    say "== 端口防护"; ipt -S "$GUARD4" 2>&1; ip6t -S "$GUARD6" 2>&1; ipt -S INPUT 2>&1 | head -n 3
+    say "== 策略路由"; ip rule show | grep -E "^$PREF:"; ip -6 rule show | grep -E "^$PREF:"; ip route show table "$TABLE" 2>&1; ip -6 route show table "$TABLE" 2>&1
+    say "== AdGuard / Tailscale 共存"; iptables-save -t nat 2>/dev/null | grep -c ADGUARD | sed 's/^/AGH nat 规则数：/'; ip rule show | grep -c 'lookup 52' | sed 's/^/Tailscale 规则数：/'
+    say "== 内存"; grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo
+    say "== 最近日志（已脱敏）"
+    tail -n 60 "$LOG" 2>/dev/null | sed -E 's#(https?://)([^/@ "]*@)?([^/ "]*)[^ "]*#\1\3/…#g; s/[0-9a-fA-F]{32,}/<redacted>/g'
+}
+
+connectivity_cmd() {
+    load_settings
+    for ct in "direct https://www.baidu.com" "direct https://www.gstatic.com/generate_204" "proxy https://www.gstatic.com/generate_204" "proxy https://www.google.com/generate_204" "proxy https://github.com"; do
+        ct_via=${ct%% *}; ct_url=${ct#* }
+        if [ "$ct_via" = proxy ]; then
+            proxy_usable || { out "@test via=proxy url=$ct_url code=skip time=0"; continue; }
+            ct_r=$("$CURL" -x "http://127.0.0.1:$MIXED_PORT" -s -o /dev/null -w '%{http_code} %{time_total}' --connect-timeout 8 --max-time 12 "$ct_url" 2>/dev/null)
+        else
+            ct_r=$("$CURL" -s -o /dev/null -w '%{http_code} %{time_total}' --connect-timeout 8 --max-time 12 "$ct_url" 2>/dev/null)
+        fi
+        out "@test via=$ct_via url=$ct_url code=${ct_r%% *} time=${ct_r#* }"
+    done
+}
+
+api_cmd() {  # api METHOD PATH [json]: controller access for pages that cannot reach it directly
+    case "$1" in GET|PUT|PATCH|DELETE|POST) ;; *) fail '方法无效'; return 1 ;; esac
+    case "$2" in /*) ;; *) fail '路径无效'; return 1 ;; esac
+    case "$2" in *[!A-Za-z0-9/_.~%?=\&:+,-]*) fail '路径无效'; return 1 ;; esac
+    core_alive || { fail '猫猫未运行'; return 1; }
+    API_TIMEOUT=20 api_call "$1" "$2" "$3"
+    kv code "$api_code"
+    cat "$API_BODY_FILE" 2>/dev/null
+    rm -f "$API_BODY_FILE"
+}
+
+uninstall_cmd() {
+    out stopped > "$STATE/want" 2>/dev/null
+    if core_alive || owned; then stop_service || { unlock_service; return 1; }; fi
+    autostart_on && autostart_set off >/dev/null
+    if [ "$1" = --purge ]; then
+        unlock_service
+        chattr -R -i "$BASE" 2>/dev/null
+        rm -rf "$BASE"
+        say '已完全卸载：/data/clash 已删除（包括配置、订阅和备份）'
+        return 0
+    fi
+    unprotect_ui
+    rm -f "$CORE" "$STATE/core.version" "$NORMALIZER"
+    rm -rf "$UI/xd"
+    protect_ui
+    unlock_service
+    rm -f "$SELF"
+    say '已卸载内核和服务；配置、订阅、设置和备份已保留'
+}
+
+# ---------------------------------------------------------------- dispatch
+dispatch() {
+    dp_cmd=${1:-status}
+    [ "$#" -gt 0 ] && shift
+    case "$dp_cmd" in
+        version) kv service_version "$SERVICE_VERSION" ;;
+        status)
+            load_settings
+            if core_alive && network_ready && watch_alive; then say "RUNNING PID=$core_pid"; return 0; fi
+            say STOPPED; return 1 ;;
+        info) info_cmd ;;
+        live) live_cmd ;;
+        secret) ensure_secret && kv secret "$SECRET" ;;
+        net-refresh)
+            ensure_dirs
+            lock_service 30 || { fail '另一个服务操作仍在进行，请稍后重试'; return 1; }
+            net_refresh_locked
+            nr_rc=$?
+            unlock_service
+            lan_config_refresh
+            return "$nr_rc" ;;
+        start|stop|restart|uninstall)
+            ensure_dirs
+            if ! lock_service 30; then
+                fail '另一个服务操作仍在进行，请稍后重试'
+                [ "$dp_cmd $1" = 'start --auto' ] && out "$(now) 自动重启未执行：服务忙" > "$STATE/last_error"
+                return 1
+            fi
+            case "$dp_cmd" in
+                start)
+                    [ "$1" = --auto ] || out running > "$STATE/want"
+                    if ! start_service "$1"; then
+                        out "$(now) 启动失败：$LAST_FAIL" > "$STATE/last_error"
+                        return 1
+                    fi ;;
+                stop) load_settings; out stopped > "$STATE/want"; stop_service ;;
+                restart) load_settings; stop_service && start_service ;;
+                uninstall) uninstall_cmd "$1" ;;
+            esac ;;
+        apply) ensure_dirs; apply_source "$1" "${2:-manual}" ;;
+        regen) ensure_dirs; regen ;;
+        settings) ensure_dirs; settings_cmd "$1" ;;
+        sub-update) ensure_dirs; sub_update "${1:-active}" ;;
+        sub-use) ensure_dirs; sub_use "$1" ;;
+        heal) heal_cmd ;;
+        apply-upload)  # apply-upload <upload> : manual config from the app upload dir
+            ensure_dirs
+            au_work=$(mktemp -d "$BASE/.apply.XXXXXX") || return 1
+            take_upload "$1" "$au_work/raw" || { rm -rf "$au_work"; return 1; }
+            apply_source "$au_work/raw" manual
+            au_rc=$?
+            rm -rf "$au_work"
+            if [ "$au_rc" = 0 ]; then set_active_sub '' || au_rc=1; fi
+            return "$au_rc" ;;
+        autostart) autostart_set "${1:-on}" ;;
+        mode) mode_cmd "$1" ;;
+        check) check_source "$1" ;;
+        boot) ensure_dirs; boot_cmd "$1" ;;
+        watch) watch_service "$@" ;;
+        job) job_cmd "$@" ;;
+        job-run) job_run "$@" ;;
+        job-status) job_status "$@" ;;
+        install) install_cmd "$@" ;;
+        core-latest) load_settings; ensure_dirs; core_latest ;;
+        geo-update) load_settings; ensure_dirs; geo_update ;;
+        dashboard-install) dashboard_install "$1" ;;
+        sub-list) sub_list ;;
+        sub-save) ensure_dirs; sub_save "$@" ;;
+        sub-delete) sub_delete "$1" ;;
+        sub-url) sub_id_ok "$1" && sub_files "$1" && [ -r "$SUB_URL" ] && kv url_b64 "$(head -n 1 "$SUB_URL" | tr -d '\n' | base64 -w 0)" ;;
+        settings-get) load_settings; for dp_k in $SETTING_KEYS; do eval "kv \"\$dp_k\" \"\$$dp_k\""; done ;;
+        source-get) if [ -s "$SOURCE" ]; then cat "$SOURCE"; elif [ -s "$CONFIG" ]; then cat "$CONFIG"; fi ;;
+        config-get) [ -s "$CONFIG" ] && sed -E 's/^(secret: ).*/\1"<hidden>"/' "$CONFIG" ;;
+        log) tail -n "${1:-200}" "$LOG" 2>/dev/null ;;
+        log-clear) : > "$LOG"; rm -f "$LOG.1"; kv cleared 1 ;;
+        cleanup) cleanup_cmd "$1" ;;
+        diag) diag_cmd ;;
+        connectivity) connectivity_cmd ;;
+        api) api_cmd "$@" ;;
+        *) say 'Usage: Clash.Service {start|stop|restart|status|info|...}'; return 2 ;;
+    esac
+}
+
+on_exit() {
+    oe_code=$?
+    trap - 0
+    [ "${startup_pending:-0}" = 1 ] && rollback_startup
+    if [ "${protections_open:-0}" = 1 ]; then geo_lock; protect_ui; fi
+    if [ -n "$JOB_RC_FILE" ]; then printf '%s\n' "$oe_code" > "$JOB_RC_FILE.tmp" && mv -f "$JOB_RC_FILE.tmp" "$JOB_RC_FILE"; fi
+    exit "$oe_code"
+}
+
+case "$0" in /*) SELF_RUN=$0 ;; *) SELF_RUN=$(pwd)/$0 ;; esac
+if [ "${USER_ID:-$(id -u)}" != 0 ]; then say 'ERROR: root is required.'; exit 1; fi
+[ -d "$STATE" ] || mkdir -p "$BASE" "$STATE" 2>/dev/null
+# Never run with / (or any foreign directory) as the working directory.
+cd "$BASE" 2>/dev/null || cd /data/local/tmp 2>/dev/null || :
+[ -e "$LOG" ] || { : > "$LOG"; chmod 600 "$LOG" 2>/dev/null; }
+startup_pending=0
+JOB_RC_FILE=
+trap on_exit 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+dispatch "$@"
+exit $?

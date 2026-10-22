@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang=zh-CN>
+<head>
+<meta charset=utf-8>
+<!-- CSP 按 sha256 放行内联脚本：修改脚本后须重算 base64(sha256(脚本文本))，否则脚本不会执行 -->
+<meta http-equiv=Content-Security-Policy content="default-src 'none'; script-src 'sha256-xpYQk2cjG56+o/LhJsAHrtsPHh1xppX7CssBiRyGHDM='; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel=icon href=data:,>
+<title>猫猫 TProxy Plus · 面板</title>
+<style>
+:root{color-scheme:dark;--bg:#111827;--card:#1f2937;--card2:#243041;--in:#374151;--bd:#4b5563;--line:#334155;--tx:#e5e7eb;--mu:#a8b0bc;--ac:#60a5fa;--acb:#2563eb;--ok:#4ade80;--okb:rgba(34,197,94,.16);--wa:#fbbf24;--wab:rgba(245,158,11,.16);--er:#fb8a8a;--erb:rgba(239,68,68,.16);--dn:#3987e5;--up:#d95926;--trk:rgba(96,165,250,.18)}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f3f4f6;--card:#fff;--card2:#f8fafc;--in:#fff;--bd:#cbd5e1;--line:#e2e8f0;--tx:#111827;--mu:#4b5563;--ac:#1d4ed8;--ok:#15803d;--okb:#dcfce7;--wa:#8a5a00;--wab:#fef3c7;--er:#b91c1c;--erb:#fee2e2;--dn:#2a78d6;--up:#eb6834;--trk:#dbeafe}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--tx);-webkit-text-size-adjust:100%}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;max-width:960px;margin:0 auto;padding:12px 14px 8px}
+h1{font-size:19px;margin:0}h2,h3{font-size:15px;margin:0}p{margin:6px 0}
+h2,h3,.gn,.nm,.f1,.to,.r2,.r3,.pl,.ll{overflow-wrap:anywhere;word-break:break-word}
+.top{position:sticky;top:0;z-index:3;background:var(--bg);border-bottom:1px solid var(--line)}
+nav{display:flex;gap:2px;overflow-x:auto;padding:6px 10px 6px max(10px,calc(50% - 468px))}
+#off{display:none;margin:0;padding:6px 12px;text-align:center;font-size:13px;color:var(--er);background:var(--erb)}.down #off{display:block}.down .tile b,.down #spark{opacity:.4}
+nav button{flex:none;border:0;background:none;color:var(--mu);padding:8px 12px;font-weight:600;min-height:38px}
+nav [aria-selected=true]{color:var(--tx);background:var(--card);box-shadow:inset 0 -2px var(--ac)}
+main,.wrap{max-width:960px;margin:0 auto;padding:12px}
+.card,.tile,.item{background:var(--card);border:1px solid var(--line);border-radius:12px}
+.card{padding:14px;margin:0 0 12px}.wrap.card{margin:12px auto;width:calc(100% - 24px);max-width:520px}
+button,input,select{font:inherit;color:inherit;border-radius:8px;min-height:36px}
+button{cursor:pointer;background:var(--in);border:1px solid var(--bd);padding:6px 12px}
+input,select{background:var(--in);border:1px solid var(--bd);padding:6px 10px;min-width:0}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.primary{background:var(--acb);border-color:var(--acb);color:#fff}
+.danger{color:var(--er);border-color:var(--er);background:none}.danger.armed{background:#dc2626;border-color:#dc2626;color:#fff}
+.busy{opacity:.75;cursor:progress}
+.busy::before{content:"";display:inline-block;width:.75em;height:.75em;margin-right:.35em;border:2px solid;border-right-color:transparent;border-radius:50%;vertical-align:-.1em;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 10px}.bar.end{justify-content:flex-end;margin:10px 0 0}
+.grow{flex:1 1 180px;display:flex;min-width:0}.grow input{width:100%}
+.row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.sr,.embed h1,.embed #st span{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.muted,.note,.empty,.r2,.r3,.lbl,.tile small{color:var(--mu)}.small,.note,.r2,.r3,.lbl{font-size:12.5px}
+.note{margin:10px 0 0}.empty{text-align:center;padding:18px 8px}
+.tag{display:inline-block;font-size:11.5px;line-height:1.5;padding:0 6px;border-radius:6px;background:var(--line);color:var(--mu);white-space:nowrap;font-weight:400}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:var(--card);font-size:13px;white-space:nowrap}
+.pill i{width:8px;height:8px;border-radius:50%;background:var(--mu)}.pill.ok i{background:var(--ok)}.pill.bad i{background:var(--er)}.pill.warn i{background:var(--wa)}
+.seg{display:flex;margin-top:10px;border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+.seg button{flex:1;border:0;border-radius:0;background:none;min-height:40px}.seg button+button{border-left:1px solid var(--bd)}
+.seg [aria-pressed=true]{background:var(--acb);color:#fff;font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:0 0 12px}
+.tile{padding:12px}.tile b{display:block;font-size:22px;font-weight:600;white-space:nowrap}.tile small{font-size:12px}
+.sw{display:inline-block;width:12px;height:3px;border-radius:2px;background:var(--dn);vertical-align:middle;margin:0 3px 0 8px}.sw.up{background:var(--up)}
+#spark{display:block;width:100%;height:72px;margin-top:8px}
+#spark *{vector-effect:non-scaling-stroke}#spark polyline{fill:none;stroke-width:2;stroke-linejoin:round}#sp-dn{stroke:var(--dn)}#sp-up{stroke:var(--up)}#spark line{stroke:var(--bd)}
+.grp{padding:0;overflow:hidden}.gh{display:flex;align-items:center;gap:8px;padding:8px 10px 8px 12px}
+.gt{flex:1;min-width:0;position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;text-align:left;background:none;border:0;padding:4px 0 4px 18px}
+.gt::before{content:"▸";position:absolute;left:2px;top:4px;color:var(--mu);transition:transform .15s}.gt[aria-expanded=true]::before{transform:rotate(90deg)}
+.gn{font-weight:600;min-width:0}
+.gnow{flex-basis:100%;color:var(--mu);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nodes{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px;padding:0 10px 10px}
+.node{display:flex;align-items:center;min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--card2)}
+.node.on{border-color:var(--ac);box-shadow:inset 3px 0 var(--ac)}
+.nn{flex:1;min-width:0;display:block;text-align:left;background:none;border:0;padding:5px 6px 5px 9px;min-height:44px}
+.nm{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13.5px;line-height:1.3}
+.ty{display:block;color:var(--mu);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lat{flex:none;margin-right:6px;min-height:28px;padding:2px 8px;border:0;border-radius:999px;font-size:12px;background:var(--line);color:var(--mu);font-variant-numeric:tabular-nums}
+.lat.g{background:var(--okb);color:var(--ok)}.lat.a{background:var(--wab);color:var(--wa)}.lat.r{background:var(--erb);color:var(--er)}
+.list{display:flex;flex-direction:column;gap:6px}.item{padding:8px 10px;min-width:0;border-radius:10px}
+.r1{display:flex;align-items:center;gap:6px}.f1{flex:1;min-width:0}.host{font-weight:600}.to{max-width:100%}
+.x{min-height:32px;padding:2px 10px;color:var(--er);background:none;border-color:var(--line)}
+.r2,.r3{margin-top:2px}
+.rule{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;font-size:13px}.rule.off{opacity:.55}
+.pl,.logs{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.pl{flex:1 1 140px;min-width:0}
+.logs{height:calc(100vh - 240px);min-height:260px;overflow:auto;padding:6px 8px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-size:12px;line-height:1.5}
+.ll{padding:2px 0;border-bottom:1px solid var(--line);white-space:pre-wrap}
+.ll time{color:var(--mu);margin-right:6px}.ll b{margin-right:6px;font-size:11px;text-transform:uppercase}
+.ll.info b{color:var(--ac)}.ll.warning b,.warn{color:var(--wa)}.ll.error b,.bad{color:var(--er)}.ll.debug b{color:var(--mu)}
+.chk{display:inline-flex;align-items:center;gap:6px}.chk input{min-height:0;width:18px;height:18px}
+.meter{height:8px;border-radius:4px;background:var(--trk);overflow:hidden;margin:10px 0 6px}
+.meter i{display:block;height:100%;background:var(--ac)}.meter i.mid{background:var(--wa)}.meter i.hi{background:var(--er)}
+footer{text-align:center;color:var(--mu);font-size:12px;padding:6px 12px 22px}
+#toasts{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;display:flex;flex-direction:column;gap:6px;width:min(92vw,420px);pointer-events:none}
+.toast{background:var(--card);border:1px solid var(--bd);border-left:4px solid var(--ac);border-radius:10px;padding:9px 12px;box-shadow:0 6px 20px rgba(0,0,0,.35);word-break:break-word;font-size:14px}
+.toast.err{border-left-color:var(--er)}.toast.ok{border-left-color:var(--ok)}.toast.warn{border-left-color:var(--wa)}
+.embed body{font-size:14px}
+.embed header{position:fixed;top:0;right:0;z-index:4;padding:13px 8px;margin:0}.embed.gated header{display:none}.embed #st{padding:0;background:none}
+.embed nav{padding:4px 30px 4px max(6px,calc(50% - 472px))}.embed nav button{padding:6px 9px;min-height:34px}
+.embed main{padding:8px}.embed .card:not(.grp){padding:10px}.embed .card{margin-bottom:8px}.embed .tiles{gap:8px;margin-bottom:8px}.embed .tile{padding:8px 10px}.embed .tile b{font-size:18px}
+.embed .logs{height:calc(100vh - 150px);min-height:200px}.embed footer{padding:4px 8px 12px}
+@media (prefers-reduced-motion:reduce){.busy::before{animation-duration:2.4s}.gt::before{transition:none}}
+</style>
+</head>
+<body>
+<header id=hdr><h1>🐱 猫猫 TProxy Plus</h1><div id=st class=pill role=status><i aria-hidden=true></i><span id=st-t>连接中…</span></div></header>
+<p id=boot class="wrap muted">正在加载…如长时间无响应，请换用新版浏览器。</p>
+<section id=gate class="card wrap" hidden>
+<h2>连接控制器</h2>
+<p id=gate-msg class=muted role=alert></p>
+<form id=lf hidden><label for=lf-s class="small muted">控制器密钥（secret）</label>
+<div class=bar><input id=lf-s class=grow type=password autocomplete=current-password required><button class=primary>连接</button></div></form>
+<button id=retry hidden>立即重试</button>
+<p class="small muted">从插件中点击“打开面板”会自动带上密钥。</p>
+</section>
+<div id=app hidden>
+<div class=top><nav id=tabs role=tablist aria-label="面板分区">
+<button id=t-ov>概览</button><button id=t-px>代理</button><button id=t-cn>连接</button><button id=t-rl>规则</button><button id=t-lg>日志</button><button id=t-pv>订阅</button>
+</nav>
+<p id=off>连接已中断，正在自动重连…数据可能已过期</p></div>
+<main>
+<section id=p-ov>
+<div class=card>
+<div class=row><h2>代理模式</h2><span class="small muted">内核 <span id=ver>—</span></span></div>
+<div id=mode class=seg role=group aria-label="代理模式"><button data-mode=rule>规则</button><button data-mode=global>全局</button><button data-mode=direct>直连</button></div>
+<p class=note>此处切换为临时生效，重启后恢复插件设置中的模式；如需永久修改请在插件“设置”中更改</p>
+</div>
+<div class=tiles>
+<div class=tile><span class=lbl>下载速率</span><b id=o-dn>—</b><small id=o-dt>累计 —</small></div>
+<div class=tile><span class=lbl>上传速率</span><b id=o-up>—</b><small id=o-ut>累计 —</small></div>
+<div class=tile><span class=lbl>内存占用</span><b id=o-mem>—</b><small>内核进程</small></div>
+<div class=tile><span class=lbl>活动连接</span><b id=o-cn>—</b><small>定时刷新</small></div>
+</div>
+<div class=card>
+<div class=row><h2>最近 60 秒</h2><span class="small muted"><i class=sw></i>下载<i class="sw up"></i>上传</span></div>
+<svg id=spark viewBox="0 0 300 64" preserveAspectRatio=none aria-hidden=true><line x1=0 y1=62.5 x2=300 y2="62.5"/><polyline id="sp-dn"/><polyline id="sp-up"/></svg>
+<p id=sp-r class="small muted">等待数据…</p>
+</div>
+</section>
+<section id=p-px>
+<div class=bar><label class=grow><span class=sr>过滤节点</span><input id=px-q type=search placeholder="过滤节点 / 策略组名称…" autocomplete=off></label><button id=px-r>刷新</button></div>
+<div id=px-list></div>
+</section>
+<section id=p-cn>
+<div class=bar><label class=grow><span class=sr>搜索连接</span><input id=cn-q type=search placeholder="搜索主机 / 规则 / 节点…" autocomplete=off></label>
+<label><span class=sr>排序方式</span><select id=cn-sort><option value=recent>最新</option><option value=traffic>流量</option><option value=speed>速度</option></select></label>
+<button id=cn-p aria-pressed=false>暂停</button><button id=cn-all class=danger>全部关闭</button></div>
+<p id=cn-sum class="small muted"></p>
+<div id=cn-list class=list></div>
+</section>
+<section id=p-rl>
+<div id=rp class=card hidden><h2>规则集合</h2><div id=rp-list class=list></div></div>
+<div class=bar><label class=grow><span class=sr>搜索规则</span><input id=rl-q type=search placeholder="搜索类型 / 内容 / 目标策略…" autocomplete=off></label><button id=rl-r>刷新</button></div>
+<p id=rl-sum class="small muted"></p>
+<div id=rl-list class=list></div>
+</section>
+<section id=p-lg>
+<div class=bar><label>级别 <select id=lg-lv><option>debug</option><option>info</option><option>warning</option><option>error</option></select></label>
+<button id=lg-p aria-pressed=false>暂停</button><button id=lg-c>清空</button><label class=chk><input id=lg-a type=checkbox checked>自动滚动</label></div>
+<p id=lg-st class="small muted"></p>
+<div id=lg-box class=logs role=log aria-live=off aria-label="日志" tabindex=0></div>
+</section>
+<section id=p-pv>
+<div class=bar><h2 class=grow>订阅源 / 代理集合</h2><button id=pv-r>刷新</button></div>
+<div id=pv-list></div>
+</section>
+</main>
+</div>
+<footer>局域网 DNS 由 F50 / AdGuard Home 处理</footer>
+<div id=toasts role=status aria-live=polite></div>
+<script>
+'use strict';
+(() => {
+const D = document, H = D.documentElement.classList, $ = id => D.getElementById(id), enc = encodeURIComponent;
+const DQ = '?url=' + enc('https://www.gstatic.com/generate_204') + '&timeout=5000';
+const GTYPE = {Selector: '手动选择', URLTest: '自动测速', Fallback: '故障转移', LoadBalance: '负载均衡', Relay: '链式代理'};
+const LEVELS = ['debug', 'info', 'warning', 'error'], TABS = ['ov', 'px', 'cn', 'rl', 'lg', 'pv'];
+const LOG_MAX = 500, CONN_MAX = 300, RULE_MAX = 500;
+
+// SECURITY: controller strings only become Text nodes or plain attribute values, never HTML
+function store(k, v) {
+	try {
+		if (v === undefined) return sessionStorage.getItem(k);
+		if (v === null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v);
+	} catch (e) {}
+	return null;
+}
+function el(tag, cls, ...kids) {
+	const e = D.createElement(tag);
+	if (cls) e.className = cls;
+	for (const k of kids) if (k != null && k !== false) e.append(k);
+	return e;
+}
+function attrs(e, o) { for (const k in o) e.setAttribute(k, o[k]); return e }
+const on = (e, ev, fn) => (typeof e == 'string' ? $(e) : e).addEventListener(ev, fn), frag = () => D.createDocumentFragment();
+function btn(text, cls, fn) {
+	const b = el('button', cls, text);
+	if (fn) on(b, 'click', () => { if (!b.classList.contains('busy')) fn() });
+	return b;
+}
+const busy = (b, v) => attrs(b, {'aria-disabled': v}).classList.toggle('busy', v);
+const keyOf = new WeakMap(), reg = (e, k) => (keyOf.set(e, k), e); // keeps focus across re-renders
+const refocus = (box, k) => { if (k) for (const b of box.querySelectorAll('button')) if (keyOf.get(b) === k) return b.focus({preventScroll: true}) };
+function bytes(n) {
+	n = Number(n) || 0;
+	let i = 0;
+	while (n >= 1024 && i < 5) { n /= 1024; i++ }
+	return (i ? n.toFixed(n < 10 ? 2 : n < 100 ? 1 : 0) : Math.round(n)) + ' ' + ['B', 'KB', 'MB', 'GB', 'TB', 'PB'][i];
+}
+const rate = n => bytes(n) + '/s', pad = n => String(n).padStart(2, '0'), lc = s => String(s == null ? '' : s).toLowerCase();
+const num = n => Number(n) || 0, arr = a => Array.isArray(a) ? a : [];
+const ts = s => { const t = Date.parse(String(s || '').replace(/\.(\d+)/, (m, d) => '.' + (d + '00').slice(0, 3))); return t > 1e11 ? t : 0 }; // Go zero time -> 0
+function ago(t) {
+	const s = (Date.now() - t) / 1000, u = [[86400, '天'], [3600, '小时'], [60, '分钟'], [1, '秒']].find(x => s >= x[0]);
+	return !t ? '—' : s < 5 ? '刚刚' : Math.floor(s / u[0]) + ' ' + u[1] + '前';
+}
+function day(t, time) {
+	const d = new Date(t);
+	return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + (time ? ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) : '');
+}
+const err = e => toast(e.message), debounce = (fn, ms = 160) => { let t = 0; return () => { clearTimeout(t); t = setTimeout(fn, ms) } };
+let lastToast = '', lastToastAt = 0;
+function toast(msg, kind = 'err', ms = 4500) {
+	msg = String(msg);
+	if (msg === lastToast && Date.now() - lastToastAt < 3000) return;
+	lastToast = msg; lastToastAt = Date.now();
+	const box = $('toasts'), t = el('div', 'toast ' + kind, msg);
+	box.append(t);
+	if (box.childElementCount > 4) box.firstElementChild.remove();
+	setTimeout(() => t.remove(), ms);
+}
+const put = (id, v) => $(id).textContent = v;
+function status(kind, text) { $('st').className = 'pill ' + kind; put('st-t', $('st').title = text) }
+
+let secret = '', embed = false, parentOrigin = '', authed = false, tab = 'ov', inView = true, MODE = '';
+const okSecret = v => !!v && !/[^\x20-\x7e]/.test(v); // header values must be printable ASCII
+function readHash() { // "#secret=…&embed=1"; strips the secret from the URL
+	const h = location.hash.slice(1), p = Object.create(null);
+	if (!h) return false;
+	for (const kv of h.split('&')) {
+		const i = kv.indexOf('=');
+		if (i > 0) try { p[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1)) } catch (e) {}
+	}
+	if (p.embed != null) embed = p.embed === '1';
+	if (p.parentOrigin != null) {
+		parentOrigin = null;
+		try {
+			const o = new URL(p.parentOrigin);
+			if (o.protocol === 'http:' && o.origin === p.parentOrigin) parentOrigin = o.origin;
+		} catch (e) {}
+	}
+	history.replaceState(null, '', location.pathname + location.search + (embed ? '#embed=1' + (parentOrigin ? '&parentOrigin=' + enc(parentOrigin) : '') : ''));
+	if (!okSecret(p.secret)) return false;
+	store('mm-secret', secret = p.secret);
+	return true;
+}
+const herr = (status, msg) => Object.assign(new Error(msg), {status});
+function headers(json) {
+	const h = {};
+	if (secret) h.Authorization = 'Bearer ' + secret;
+	if (json) h['Content-Type'] = 'application/json';
+	return h;
+}
+let up = true, hpT = 0, hpWait = 1000;
+const seen = () => D.visibilityState === 'visible' && inView, live = () => authed && seen();
+const paint = () => { status(up ? 'ok' : 'bad', up ? '已连接' : '连接中断'); $('app').classList.toggle('down', !up) };
+function online(ok) {
+	if (!authed || ok === up) return;
+	up = ok;
+	paint();
+	if (!ok) return toast('连接已中断，正在自动重连…'), watch();
+	hpWait = 1000;
+	toast('已重新连接控制器', 'ok', 2500);
+	for (const s of STREAMS) s.kick();
+	enter(tab); // refresh stale data
+}
+function watch(ms = hpWait) { // offline: probe until the controller answers
+	if (hpT || up || !live()) return;
+	hpT = setTimeout(async () => {
+		const t = Date.now();
+		hpT = -1;
+		try { await api('/version') } catch (e) {}
+		hpT = 0;
+		hpWait = Math.min(hpWait * 2, 10000);
+		watch(Math.max(500, hpWait - Date.now() + t)); // hung controller: keep a probe pending
+	}, ms);
+}
+async function api(path, {method = 'GET', body, timeout = 10000} = {}) {
+	const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), timeout), used = secret;
+	try {
+		let r, text;
+		try {
+			r = await fetch(path, {method, headers: headers(body), body: body && JSON.stringify(body), signal: ctl.signal, cache: 'no-store', credentials: 'omit'});
+			text = r.status === 204 ? '' : await r.text();
+		} catch (e) {
+			const to = ctl.signal.aborted;
+			if (!to || timeout <= 10000) online(false); // hung controller
+			throw herr(0, to ? '请求超时' : '网络错误：无法连接控制器');
+		}
+		let data = null;
+		if (text) try { data = JSON.parse(text) } catch (e) { if (r.ok) throw herr(r.status, '控制器返回了无法解析的数据') }
+		if (r.status === 401) { authFailed(used); throw herr(401, 'HTTP 401 密钥错误') }
+		if (!r.ok) throw herr(r.status, 'HTTP ' + r.status + (data && typeof data.message === 'string' ? '：' + data.message : ''));
+		online(true);
+		return data;
+	} finally { clearTimeout(timer) }
+}
+// mihomo streams NDJSON for a plain (non-websocket) GET
+const STREAMS = [];
+function stream(path, onData, stall, onState = () => {}) { // onState: null connecting, true open, false down
+	let active = false, ctl = null, timer = 0, wait = 1000;
+	const run = async () => {
+		timer = 0;
+		const c = ctl = new AbortController(), used = secret, cur = () => ctl === c;
+		let last = Date.now(), open = false;
+		const opened = () => { if (!open && cur()) { open = true; wait = 1000; online(true); onState(true) } };
+		onState(null);
+		// watchdog also covers a hung connect; /logs sends headers only with its first line,
+		// so a quiet stream (no stall limit) confirms the connect with a probe
+		const wd = stall && setInterval(() => { if (Date.now() - last > stall) c.abort() }, 1000);
+		const pt = !stall && setTimeout(() => api('/version').then(opened, () => c.abort()), 2000);
+		try {
+			const r = await fetch(path(), {headers: headers(), signal: c.signal, cache: 'no-store', credentials: 'omit'});
+			clearTimeout(pt);
+			if (r.status === 401) return authFailed(used);
+			if (!r.ok || !r.body) throw 0;
+			opened();
+			const rd = r.body.getReader(), dec = new TextDecoder();
+			let buf = '';
+			for (;;) {
+				const {done, value} = await rd.read();
+				if (done) break;
+				last = Date.now();
+				buf += dec.decode(value, {stream: true});
+				let i;
+				while ((i = buf.indexOf('\n')) >= 0) {
+					const line = buf.slice(0, i).trim();
+					buf = buf.slice(i + 1);
+					let o = null;
+					if (line && cur()) try { o = JSON.parse(line) } catch (e) {}
+					if (o && typeof o === 'object') onData(o);
+				}
+				if (buf.length > 1048576) buf = '';
+			}
+		} catch (e) {} finally { clearInterval(wd); clearTimeout(pt) }
+		if (!active || !cur()) return; // stopped or restarted
+		online(false);
+		onState(false, wait);
+		timer = setTimeout(run, wait);
+		wait = Math.min(wait * 2, 30000);
+	};
+	const s = {
+		set(v) {
+			if (v === active) return;
+			active = v; clearTimeout(timer); timer = 0;
+			if (ctl) ctl.abort();
+			ctl = null;
+			if (v) { wait = 1000; run() }
+		},
+		restart() { if (active) { s.set(false); s.set(true) } },
+		kick() { if (timer) { clearTimeout(timer); run() } } // controller is back: skip the backoff
+	};
+	STREAMS.push(s);
+	return s;
+}
+function poller(fn, ms) { // fn may return the next delay
+	let active = false, gen = 0, t = 0;
+	const run = async g => {
+		let next = ms;
+		try { next = await fn() || ms } catch (e) { if (e.status && e.status !== 401) toast(e.message) }
+		if (active && g === gen) t = setTimeout(() => run(g), next);
+	};
+	return { set(v) { if (v !== active) { active = v; gen++; clearTimeout(t); if (v) run(gen) } } };
+}
+function actBtn(label, name, path, method, done, reload) {
+	const b = btn(label, '', async () => {
+		busy(b, true);
+		try { await api(path, {method, timeout: 90000}); toast(name + '：' + done, 'ok', 3000) } catch (e) { toast(name + '：' + e.message) }
+		busy(b, false);
+		reload().catch(err);
+	});
+	return attrs(b, {'aria-label': label + '：' + name});
+}
+
+const spark = [];
+let hasTotals = false, modeBusy = false;
+const sTraffic = stream(() => '/traffic', onTraffic, 8000, ok => {
+	if (ok) { spark.length = 0; drawSpark() } else if (ok === false) put('o-dn', put('o-up', '—'));
+});
+const sMemory = stream(() => '/memory', m => { if (m.inuse) put('o-mem', bytes(m.inuse)) }, 8000);
+const pOverview = poller(async () => { // count only; big snapshots less often (router CPU)
+	const d = await api('/connections'), n = arr(d && d.connections).length, s = Math.min(30, Math.max(5, Math.ceil(n / 10)));
+	put('o-cn', n);
+	if (!hasTotals && d) totals(d.uploadTotal, d.downloadTotal);
+	return s * 1000;
+}, 5000);
+function totals(u, d) { put('o-ut', '累计 ' + bytes(u)); put('o-dt', '累计 ' + bytes(d)) }
+function onTraffic(t) {
+	spark.push([num(t.down), num(t.up)]);
+	if (spark.length > 60) spark.shift();
+	put('o-dn', rate(t.down));
+	put('o-up', rate(t.up));
+	if (t.downTotal != null) { hasTotals = true; totals(t.upTotal, t.downTotal) }
+	drawSpark();
+}
+function drawSpark() {
+	const n = spark.length, max = Math.max(1024, ...spark.map(s => Math.max(s[0], s[1]))), x = i => 300 - (n - 1 - i) * 5;
+	const pts = k => spark.map((s, i) => x(i) + ',' + (62 - s[k] / max * 56).toFixed(1)).join(' ');
+	$('sp-dn').setAttribute('points', pts(0));
+	$('sp-up').setAttribute('points', pts(1));
+	const peak = k => rate(Math.max(...spark.map(s => s[k])));
+	put('sp-r', n ? '峰值：下载 ' + peak(0) + ' · 上传 ' + peak(1) : '等待数据…');
+}
+function takeMode(c) {
+	MODE = lc(c && c.mode);
+	for (const b of $('mode').children) b.setAttribute('aria-pressed', b.dataset.mode === MODE);
+}
+const loadConfig = async () => takeMode(await api('/configs'));
+async function setMode(m, b) {
+	if (modeBusy || m === MODE) return;
+	modeBusy = true;
+	busy(b, true);
+	try {
+		await api('/configs', {method: 'PATCH', body: {mode: m}});
+		takeMode({mode: m});
+		toast('已切换为' + b.textContent + '模式（临时生效）', 'ok', 3000);
+	} catch (e) { err(e) }
+	busy(b, false);
+	modeBusy = false;
+	loadConfig().catch(() => {});
+}
+
+let PX = new Map(), pxSeq = 0, gid = 0, badges = new Map(), firstOpen = true;
+const tG = new Set(), tN = new Set(), openG = new Set(), fresh = new Map(); // node -> [delay, test end]
+const addDelay = (n, d) => { const p = PX.get(n); if (p) p.history = arr(p.history).concat({delay: d}).slice(-10) };
+async function loadProxies() {
+	const seq = ++pxSeq, t0 = Date.now(), [c, p] = await Promise.all([api('/configs'), api('/proxies')]);
+	const m = new Map(Object.entries((p && p.proxies) || {}));
+	// proxy-provider nodes are not keys of /proxies
+	if ([...m.values()].some(g => g && arr(g.all).some(n => !m.has(n)))) {
+		const pv = await api('/providers/proxies').catch(() => null);
+		for (const prov of Object.values((pv && pv.providers) || {}))
+			for (const x of arr(prov && prov.proxies)) if (x && typeof x.name === 'string' && !m.has(x.name)) m.set(x.name, x);
+	}
+	if (seq !== pxSeq) return;
+	takeMode(c);
+	PX = m;
+	// tests that ended after this request may be missing
+	for (const [n, [d, t]] of fresh) if (t < t0) fresh.delete(n); else addDelay(n, d);
+	if (firstOpen) { firstOpen = false; const f = groupNames()[0]; if (f) openG.add(f) }
+	renderGroups();
+}
+function groupNames() { // config order (GLOBAL.all); GLOBAL only in global mode
+	const out = [], done = new Set(['GLOBAL']), G = PX.get('GLOBAL'), ok = g => g && Array.isArray(g.all);
+	const add = n => { const g = PX.get(n); if (!done.has(n) && ok(g) && !g.hidden) { done.add(n); out.push(n) } };
+	if (ok(G)) G.all.forEach(add);
+	for (const n of PX.keys()) add(n);
+	if (MODE === 'global' && ok(G)) out.unshift('GLOBAL');
+	return out;
+}
+function delayOf(n) { // 0 timeout, -1 never tested
+	const p = PX.get(n), h = arr(p && p.history), e = h[h.length - 1];
+	return e ? num(e.delay) : -1;
+}
+function paintBadge(b, n) {
+	const d = delayOf(n), t = tN.has(n), txt = t ? '测速' : d < 0 ? '未测' : d ? d + ' ms' : '超时';
+	b.className = 'lat' + (t ? ' busy' : d < 0 ? '' : d && d < 300 ? ' g' : d && d < 800 ? ' a' : ' r');
+	b.textContent = txt;
+	b.setAttribute('aria-label', n + '：' + (t ? '测速中' : txt) + '，点击测速');
+}
+const paintNode = n => (badges.get(n) || []).forEach(b => paintBadge(b, n));
+function renderGroups() {
+	const box = $('px-list'), fk = keyOf.get(D.activeElement), q = lc($('px-q').value.trim()), f = frag();
+	badges = new Map();
+	for (const name of groupNames()) {
+		const g = PX.get(name), nodes = !q || lc(name).includes(q) ? g.all : g.all.filter(n => lc(n).includes(q));
+		if (!q || nodes.length) f.append(groupCard(name, g, nodes, !!q || openG.has(name), q));
+	}
+	if (!f.childNodes.length) f.append(el('p', 'empty', q ? '没有匹配的节点' : '没有可显示的策略组'));
+	box.replaceChildren(f);
+	refocus(box, fk);
+}
+function groupCard(name, g, nodes, open, q) {
+	const list = el('div', 'nodes'), tog = reg(btn(null, 'gt'), 'g\0' + name);
+	list.id = 'g' + ++gid;
+	list.hidden = !open;
+	attrs(tog, {'aria-expanded': open, 'aria-controls': list.id}).append(el('span', 'gn', name), el('span', 'tag', GTYPE[g.type] || String(g.type || '?')),
+		el('span', 'small muted', nodes.length + ' 个'), el('span', 'gnow', g.now ? '当前：' + g.now : g.type === 'LoadBalance' ? '按策略分配连接' : '—'));
+	on(tog, 'click', () => {
+		const o = list.hidden;
+		list.hidden = !o;
+		tog.setAttribute('aria-expanded', o);
+		if (o && !list.firstChild) fillNodes(list, name, g, nodes);
+		if (!q) openG[o ? 'add' : 'delete'](name);
+	});
+	const tb = attrs(reg(btn('测速', '', () => testGroup(name)), 't\0' + name), {'aria-label': '测速：' + name});
+	if (tG.has(name)) busy(tb, true);
+	if (open) fillNodes(list, name, g, nodes);
+	return el('article', 'card grp', el('div', 'gh', tog, tb), list);
+}
+function fillNodes(list, gname, g, nodes) {
+	const sel = g.type === 'Selector', f = frag();
+	for (const n of nodes) {
+		const p = PX.get(n), cur = n === g.now, k = gname + '\0' + n;
+		const main = sel ? attrs(reg(btn(null, 'nn', () => choose(gname, n)), 's\0' + k), {'aria-pressed': cur}) : el('div', 'nn');
+		main.append(el('span', 'nm', n), el('span', 'ty', p ? (Array.isArray(p.all) ? '策略组 · ' : '') + String(p.type || '') : '—'));
+		if (!sel && cur) main.append(el('span', 'sr', '（当前）'));
+		const b = reg(btn('', 'lat', () => testNode(n)), 'l\0' + k);
+		paintBadge(b, n);
+		if (!badges.has(n)) badges.set(n, []);
+		badges.get(n).push(b);
+		f.append(el('div', cur ? 'node on' : 'node', main, b));
+	}
+	list.append(f);
+}
+async function choose(group, n) {
+	try {
+		await api('/proxies/' + enc(group), {method: 'PUT', body: {name: n}});
+		const g = PX.get(group);
+		if (g) g.now = n;
+		renderGroups();
+		toast('已切换：' + group + ' → ' + n, 'ok', 2500);
+	} catch (e) { err(e) }
+	loadProxies().catch(() => {});
+}
+async function testGroup(name) {
+	if (tG.has(name)) return;
+	tG.add(name);
+	renderGroups();
+	try {
+		const r = await api('/group/' + enc(name) + '/delay' + DQ, {timeout: 20000});
+		toast(name + '：' + Object.keys(r || {}).length + ' 个节点可用', 'ok', 2500);
+	} catch (e) { if (e.status === 504) toast(name + '：全部节点超时', 'warn'); else err(e) }
+	tG.delete(name);
+	renderGroups();
+	loadProxies().catch(err);
+}
+async function testNode(n) {
+	if (tN.has(n)) return;
+	tN.add(n);
+	paintNode(n);
+	const prov = (PX.get(n) || {})['provider-name'];
+	let d = -1;
+	try { // provider nodes: only via their provider
+		const r = await api(prov ? '/providers/proxies/' + enc(prov) + '/' + enc(n) + '/healthcheck' + DQ : '/proxies/' + enc(n) + '/delay' + DQ, {timeout: 15000});
+		d = num(r && r.delay);
+	} catch (e) { if (e.status === 503 || e.status === 504) d = 0; else toast(e.message) } // 503/504: timeout
+	tN.delete(n);
+	if (d >= 0) { fresh.set(n, [d, Date.now()]); addDelay(n, d) }
+	paintNode(n);
+}
+
+let CN = [], cnPrev = new Map(), cnSnap = null, cnPaused = false, armT = 0;
+const traffic = c => num(c.upload) + num(c.download);
+const pConns = poller(async () => {
+	const d = await api('/connections'), now = Date.now(), next = new Map();
+	CN = arr(d && d.connections);
+	for (const c of CN) {
+		const t = traffic(c), p = cnPrev.get(c.id);
+		c._s = p && now > p[1] ? Math.max(0, (t - p[0]) * 1000 / (now - p[1])) : 0;
+		next.set(c.id, [t, now]);
+	}
+	cnPrev = next;
+	cnSnap = d;
+	renderConns();
+}, 2000);
+function hay(c) {
+	const m = c.metadata || {};
+	return lc([m.host, m.sniffHost, m.destinationIP, m.remoteDestination, m.destinationPort, m.sourceIP, m.network, m.type, m.process, c.rule, c.rulePayload].concat(c.chains).join(' '));
+}
+function renderConns() {
+	const box = $('cn-list'), fk = keyOf.get(D.activeElement), q = lc($('cn-q').value.trim()), s = $('cn-sort').value, f = frag();
+	const key = s === 'traffic' ? traffic : s === 'speed' ? c => c._s || 0 : c => ts(c.start);
+	const list = (q ? CN.filter(c => hay(c).includes(q)) : CN.slice()).sort((a, b) => key(b) - key(a));
+	for (const c of list.slice(0, CONN_MAX)) f.append(connRow(c));
+	if (!list.length) f.append(el('p', 'empty', q ? '没有匹配的连接' : '暂无活动连接'));
+	box.replaceChildren(f);
+	refocus(box, fk);
+	put('cn-sum', '活动连接 ' + CN.length + (q ? '，匹配 ' + list.length : '') + (list.length > CONN_MAX ? '，仅显示前 ' + CONN_MAX + ' 条' : '') +
+		(cnSnap ? ' · 总上传 ' + bytes(cnSnap.uploadTotal) + ' · 总下载 ' + bytes(cnSnap.downloadTotal) : '') + (cnPaused ? ' · 已暂停刷新' : ''));
+}
+function connRow(c) {
+	const m = c.metadata || {}, ip = String(m.destinationIP || ''), row = el('div', 'item');
+	const host = (m.host || m.sniffHost || (ip.includes(':') ? '[' + ip + ']' : ip) || '?') + (m.destinationPort ? ':' + m.destinationPort : '');
+	const chain = arr(c.chains).slice().reverse().join(' → '); // final node first in mihomo
+	const x = attrs(reg(btn('✕', 'x', () => closeConn(c.id, row, x)), 'c\0' + c.id), {'aria-label': '关闭连接 ' + host});
+	row.append(el('div', 'r1', el('span', 'f1 host', host), el('span', 'tag', String(m.network || '').toUpperCase()), x),
+		el('div', 'r2', String(c.rule || '—') + (c.rulePayload ? '(' + c.rulePayload + ')' : '') + (chain ? ' · ' + chain : '')),
+		el('div', 'r3', '↑ ' + bytes(c.upload) + '　↓ ' + bytes(c.download) + (c._s ? '　' + rate(c._s) : '') + '　' + ago(ts(c.start)) + (m.sourceIP ? '　来自 ' + m.sourceIP : '')));
+	return row;
+}
+async function closeConn(id, row, b) {
+	busy(b, true);
+	try {
+		await api('/connections/' + enc(id), {method: 'DELETE'});
+		const next = b === D.activeElement && (row.nextElementSibling || row.previousElementSibling), nb = next && next.querySelector('button');
+		row.remove();
+		CN = CN.filter(c => c.id !== id);
+		if (nb) nb.focus();
+	} catch (e) { busy(b, false); toast(e.message) }
+}
+function disarm() { clearTimeout(armT); $('cn-all').classList.remove('armed'); put('cn-all', '全部关闭') }
+async function closeAll() {
+	const b = $('cn-all');
+	if (!b.classList.contains('armed')) { // two-step: confirm() may be blocked in iframes
+		b.classList.add('armed');
+		b.textContent = '确认关闭全部？';
+		armT = setTimeout(disarm, 4000);
+		return;
+	}
+	disarm();
+	try {
+		await api('/connections', {method: 'DELETE'});
+		toast('已关闭全部连接', 'ok', 2500);
+		CN = [];
+		renderConns();
+	} catch (e) { err(e) }
+}
+
+let RULES = [];
+async function loadRules() {
+	const [r] = await Promise.all([api('/rules'), loadRuleProviders().catch(() => {})]);
+	RULES = arr(r && r.rules);
+	renderRules();
+}
+function renderRules() {
+	const q = lc($('rl-q').value.trim()), f = frag();
+	const list = q ? RULES.filter(r => lc(r.type + ' ' + r.payload + ' ' + r.proxy).includes(q)) : RULES;
+	put('rl-sum', '共 ' + RULES.length + ' 条规则' + (q ? '，匹配 ' + list.length + ' 条' : '') + (list.length > RULE_MAX ? '，仅显示前 ' + RULE_MAX + ' 条' : ''));
+	list.slice(0, RULE_MAX).forEach((r, i) => {
+		const x = r.extra;
+		f.append(el('div', 'item rule' + (x && x.disabled ? ' off' : ''), el('span', 'small muted', '#' + ((Number.isInteger(r.index) ? r.index : i) + 1)),
+			el('span', 'tag', String(r.type || '?')), el('span', 'pl', String(r.payload || '') || '—'), el('span', 'to', '→ ' + String(r.proxy || '')),
+			r.size > 0 ? el('span', 'small muted', r.size + ' 条') : null, x ? el('span', 'small muted', (x.disabled ? '已禁用 · ' : '') + '命中 ' + num(x.hitCount)) : null));
+	});
+	if (!list.length) f.append(el('p', 'empty', q ? '没有匹配的规则' : '没有规则'));
+	$('rl-list').replaceChildren(f);
+}
+async function loadRuleProviders() {
+	const d = await api('/providers/rules'), list = Object.values((d && d.providers) || {}).filter(Boolean), f = frag();
+	for (const p of list) {
+		const name = String(p.name || ''), up = ts(p.updatedAt);
+		const row = el('div', 'item r1', el('div', 'f1', el('div', 'host', name), el('div', 'small muted',
+			[p.behavior, p.format, p.vehicleType].filter(Boolean).join(' · ') + ' · ' + num(p.ruleCount) + ' 条 · ' + (up ? '更新于 ' + ago(up) : '未更新'))));
+		if (p.vehicleType === 'HTTP' || p.vehicleType === 'File') row.append(actBtn('更新', name, '/providers/rules/' + enc(name), 'PUT', '已更新', loadRuleProviders));
+		f.append(row);
+	}
+	$('rp-list').replaceChildren(f);
+	$('rp').hidden = !list.length;
+}
+
+let lgQ = [], lgT = 0, lgPaused = false, lgState = '', lgLevel = store('mm-lv');
+if (!LEVELS.includes(lgLevel)) lgLevel = 'warning';
+const sLogs = stream(() => '/logs?level=' + lgLevel, onLog, 0, (ok, wait) => {
+	lgState = ok ? '已连接' : ok === null ? '正在连接…' : '连接中断，' + Math.round(wait / 1000) + ' 秒后重连';
+	lgStat();
+});
+function onLog(o) {
+	lgQ.push([new Date(), String(o.type || ''), String(o.payload == null ? '' : o.payload)]);
+	if (lgQ.length > LOG_MAX) lgQ.splice(0, lgQ.length - LOG_MAX);
+	if (lgPaused) lgStat(); else if (!lgT) lgT = setTimeout(flushLogs, 120);
+}
+function flushLogs() {
+	lgT = 0;
+	if (lgPaused || !lgQ.length) return;
+	const box = $('lg-box'), f = frag();
+	for (const [d, type, msg] of lgQ) f.append(el('div', 'll ' + (LEVELS.includes(type) ? type : 'info'),
+		el('time', '', pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())), el('b', '', type || '?'), msg));
+	lgQ = [];
+	box.append(f);
+	for (let n = box.childElementCount - LOG_MAX; n > 0; n--) box.firstElementChild.remove();
+	if ($('lg-a').checked) box.scrollTop = box.scrollHeight;
+	lgStat();
+}
+function lgStat() {
+	put('lg-st', (lgPaused ? '已暂停' + (lgQ.length ? '，已缓冲 ' + lgQ.length + ' 行' : '') : lgState) + ' · 级别 ' + lgLevel + ' · 显示 ' + $('lg-box').childElementCount + ' / ' + LOG_MAX + ' 行');
+}
+
+async function loadProviders() {
+	const d = await api('/providers/proxies'), f = frag();
+	const list = Object.values((d && d.providers) || {}).filter(p => p && (p.vehicleType === 'HTTP' || p.vehicleType === 'File'));
+	for (const p of list) f.append(provCard(p));
+	if (!list.length) f.append(el('p', 'empty', '未使用代理集合（proxy-providers）。插件“订阅管理”的订阅直接写入配置，节点见“代理”页。'));
+	$('pv-list').replaceChildren(f);
+}
+function provCard(p) {
+	const name = String(p.name || ''), up = ts(p.updatedAt), si = p.subscriptionInfo, path = '/providers/proxies/' + enc(name);
+	const card = el('article', 'card', el('div', 'row', el('h3', '', name), el('span', 'tag', p.vehicleType === 'HTTP' ? '远程订阅' : '本地文件')),
+		el('p', 'small muted', arr(p.proxies).length + ' 个节点 · ' + (up ? '更新于 ' + day(up, true) + '（' + ago(up) + '）' : '尚未更新')));
+	if (si && typeof si === 'object' && (si.Total || si.Upload || si.Download || si.Expire)) card.append(subInfo(si));
+	card.append(el('div', 'bar end', actBtn('更新', name, path, 'PUT', '已更新', loadProviders), actBtn('健康检查', name, path + '/healthcheck', 'GET', '健康检查完成', loadProviders)));
+	return card;
+}
+function subInfo(si) { // bytes; Expire in unix seconds
+	const upl = num(si.Upload), dl = num(si.Download), used = upl + dl, total = num(si.Total), exp = num(si.Expire), box = el('div', '');
+	if (total > 0) {
+		const pct = Math.min(100, used / total * 100), fill = el('i', pct >= 90 ? 'hi' : pct >= 70 ? 'mid' : '');
+		fill.style.width = pct.toFixed(1) + '%';
+		box.append(attrs(el('div', 'meter', fill), {role: 'progressbar', 'aria-label': '流量已用', 'aria-valuenow': Math.round(pct)}));
+	}
+	box.append(el('div', 'small', '已用 ' + bytes(used) + (total > 0 ? ' / ' + bytes(total) + '（' + (used / total * 100).toFixed(1) + '%）' : '') + '　↑ ' + bytes(upl) + '　↓ ' + bytes(dl)));
+	if (exp > 0) {
+		const t = exp > 1e12 ? exp : exp * 1000, left = Math.ceil((t - Date.now()) / 864e5);
+		box.append(el('div', 'small' + (left < 0 ? ' bad' : left <= 7 ? ' warn' : ''), left < 0 ? '已于 ' + day(t) + ' 过期' : '到期 ' + day(t) + '（剩余 ' + left + ' 天）'));
+	} else box.append(el('div', 'small muted', '到期：长期有效'));
+	return box;
+}
+
+function sync() { // live requests: visible tab of a visible page only
+	const v = live();
+	sTraffic.set(v && tab === 'ov');
+	sMemory.set(v && tab === 'ov');
+	pOverview.set(v && tab === 'ov');
+	pConns.set(v && tab === 'cn' && !cnPaused);
+	sLogs.set(v && tab === 'lg');
+	if (v) watch(500); else if (hpT > 0) clearTimeout(hpT), hpT = 0;
+}
+function enter(t) {
+	const f = {ov: loadConfig, px: loadProxies, rl: loadRules, pv: loadProviders}[t];
+	if (f) f().catch(err);
+}
+function show(t) {
+	tab = TABS.includes(t) ? t : 'ov';
+	store('mm-tab', tab);
+	for (const x of TABS) {
+		attrs($('t-' + x), {'aria-selected': x === tab, tabindex: x === tab ? 0 : -1});
+		$('p-' + x).hidden = x !== tab;
+	}
+	if (tab !== 'cn') disarm();
+	if (tab === 'lg') lgStat();
+	enter(tab);
+	sync();
+}
+function gate(msg, form) {
+	H.add('gated'); // embed: no dot over the card
+	$('app').hidden = true;
+	$('gate').hidden = false;
+	put('gate-msg', msg);
+	$('lf').hidden = !form;
+	$('retry').hidden = form;
+	if (form) $('lf-s').focus();
+}
+function authFailed(used) {
+	if (used !== secret) return; // stale, or the login form is up
+	const had = !!secret;
+	authed = false;
+	secret = '';
+	store('mm-secret', null);
+	clearTimeout(bootT); bootDue = false;
+	sync();
+	if (had) toast('HTTP 401 密钥错误');
+	gate(had ? '密钥错误或已失效，请重新输入控制器密钥。' : '请输入控制器密钥。', true);
+	status('warn', '需要密钥');
+}
+let bootT = 0, bootWait = 2000, bootDue = false;
+async function boot() {
+	clearTimeout(bootT); bootDue = false;
+	authed = false;
+	sync();
+	status('', '连接中…');
+	let v;
+	try { v = await api('/version') } catch (e) {
+		if (e.status === 401) return; // authFailed() shows the form
+		gate(e.message + '，' + bootWait / 1000 + ' 秒后自动重试…', false);
+		status('bad', '无法连接');
+		bootT = setTimeout(() => seen() ? boot() : bootDue = true, bootWait);
+		bootWait = Math.min(bootWait * 2, 32000);
+		return;
+	}
+	bootWait = 2000;
+	if (secret) store('mm-secret', secret);
+	put('ver', String((v && v.version) || '?') + (v && v.meta ? ' (Meta)' : ''));
+	authed = up = true;
+	paint();
+	H.remove('gated');
+	$('gate').hidden = true;
+	$('app').hidden = false;
+	show(store('mm-tab'));
+}
+function toggler(id, fn) {
+	const b = $(id);
+	on(b, 'click', () => {
+		const p = b.getAttribute('aria-pressed') !== 'true';
+		attrs(b, {'aria-pressed': p}).textContent = p ? '继续' : '暂停';
+		fn(p);
+	});
+}
+
+for (const x of TABS) {
+	attrs($('t-' + x), {role: 'tab', 'aria-controls': 'p-' + x});
+	attrs($('p-' + x), {role: 'tabpanel', 'aria-labelledby': 't-' + x});
+	on('t-' + x, 'click', () => show(x));
+}
+on('tabs', 'keydown', e => {
+	const i = TABS.indexOf(tab), k = e.key, j = k === 'ArrowRight' ? i + 1 : k === 'ArrowLeft' ? i - 1 : k === 'Home' ? 0 : k === 'End' ? -1 : null;
+	if (j === null) return;
+	e.preventDefault();
+	show(TABS[(j + TABS.length) % TABS.length]);
+	$('t-' + tab).focus();
+});
+for (const b of $('mode').children) on(b, 'click', () => setMode(b.dataset.mode, b));
+on('px-q', 'input', debounce(renderGroups));
+on('px-r', 'click', () => loadProxies().then(() => toast('节点已刷新', 'ok', 1500)).catch(err));
+on('cn-q', 'input', debounce(renderConns));
+on('cn-sort', 'change', renderConns);
+toggler('cn-p', p => { cnPaused = p; renderConns(); sync() });
+on('cn-all', 'click', closeAll);
+on('rl-q', 'input', debounce(renderRules, 200));
+on('rl-r', 'click', () => loadRules().catch(err));
+on('pv-r', 'click', () => loadProviders().catch(err));
+$('lg-lv').value = lgLevel;
+on('lg-lv', 'change', () => {
+	store('mm-lv', lgLevel = $('lg-lv').value);
+	sLogs.restart();
+	lgStat();
+});
+toggler('lg-p', p => { lgPaused = p; if (!p) flushLogs(); lgStat() });
+on('lg-c', 'click', () => { $('lg-box').replaceChildren(); lgQ = []; lgStat() });
+on('lf', 'submit', e => {
+	e.preventDefault();
+	const v = $('lf-s').value.trim();
+	if (!okSecret(v)) return void put('gate-msg', '密钥只能包含英文字母、数字和半角符号。');
+	secret = v;
+	$('lf-s').value = '';
+	boot();
+});
+on('retry', 'click', () => { bootWait = 2000; boot() });
+const wake = () => { sync(); if (bootDue && seen()) boot() }; // paused boot retry
+on(D, 'visibilitychange', () => {
+	wake();
+	if (live() && (tab === 'ov' || tab === 'px')) enter(tab);
+});
+on(window, 'hashchange', () => { if (readHash()) boot(); H.toggle('embed', embed) });
+on(window, 'message', e => {
+	if (!embed || parentOrigin === null || window.parent === window || e.source !== window.parent) return;
+	let origin;
+	try { origin = new URL(e.origin) } catch (e) { return }
+	if (origin.protocol !== 'http:' || location.protocol !== 'http:') return;
+	// New hosts declare their exact origin; older hosts use the same hostname on another port.
+	if (parentOrigin ? e.origin !== parentOrigin : origin.hostname !== location.hostname) return;
+	const data = e.data;
+	if (!data || data.type !== 'mm-secret' || typeof data.secret !== 'string' || !/^[a-f0-9]{48}$/.test(data.secret)) return;
+	if (authed && data.secret === secret) return;
+	store('mm-secret', secret = data.secret);
+	boot();
+});
+on(window, 'unhandledrejection', e => { if (e.reason && e.reason.message) toast(e.reason.message) });
+if (window.top !== window && window.IntersectionObserver) { // iframe scrolled away: pause
+	new IntersectionObserver(es => {
+		const v = es[es.length - 1].isIntersecting;
+		if (v !== inView) { inView = v; wake() }
+	}).observe(D.body);
+}
+
+$('boot').remove();
+readHash();
+if (!secret && okSecret(store('mm-secret'))) secret = store('mm-secret');
+H.toggle('embed', embed);
+boot();
+})();
+</script>
+</body>
+</html>

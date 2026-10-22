@@ -1,0 +1,16 @@
+node_modules/
+__pycache__/
+*.py[cod]
+.DS_Store
+.local/
+.env
+.env.*
+!.env.example
+login.json
+*.secret
+*.url
+*.log
+*.tgz
+*.tar.gz
+*.zip
+/dist/

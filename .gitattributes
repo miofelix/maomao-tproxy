@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.js text eol=lf
+*.html text eol=lf
+*.awk text eol=lf
+Clash.Service text eol=lf

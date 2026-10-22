@@ -1,0 +1,20 @@
+{
+  "name": "maomao-tproxy-plus",
+  "version": "1.0.0",
+  "private": true,
+  "description": "猫猫 TProxy Plus — 基于原版独立增强的 UFI-TOOLS 透明代理插件",
+  "license": "MIT",
+  "scripts": {
+    "build": "python3 build-plugin.py",
+    "check": "npm run build && python3 build-plugin.py --check && sh -n Clash.Service",
+    "test:normalize": "python3 -I tests/test_normalize.py",
+    "test:ui": "node tests/ui_harness.cjs",
+    "test": "npm run check && npm run test:normalize && npm run test:ui"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
